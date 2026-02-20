@@ -5,51 +5,79 @@ import gi
 from typing import Callable, Optional
 
 gi.require_version("Gtk", "3.0")
-from gi.repository import Gtk, Gio, GLib
+from gi.repository import Gtk, Gio, GLib, Pango
 
 from models import Conversation
 
 
-class ConversationItem(Gtk.Box):
-    """A single conversation item in the sidebar."""
+class ConversationItem(Gtk.EventBox):
+    """A single conversation item in the sidebar - compact single row."""
 
-    def __init__(self, conversation: Conversation, on_select: Callable[[Conversation], None]):
+    def __init__(
+        self,
+        conversation: Conversation,
+        on_select: Callable[[Conversation], None],
+        on_delete: Optional[Callable[[Conversation], None]] = None,
+    ):
         """Initialize the conversation item.
         
         Args:
             conversation: The conversation to display.
             on_select: Callback when the item is selected.
+            on_delete: Callback when delete is requested.
         """
-        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        super().__init__()
+        self.get_style_context().add_class("conversation-item")
         self.conversation = conversation
-        self.set_size_request(-1, 56)
-        self.set_margin_start(4)
-        self.set_margin_end(4)
-        self.set_margin_top(3)
-        self.set_margin_bottom(3)
         
-        # Title
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        row.set_size_request(-1, 32)
+        row.set_margin_start(4)
+        row.set_margin_end(4)
+        row.set_margin_top(2)
+        row.set_margin_bottom(2)
+        
+        # Title - expands, ellipsizes when long
         title = Gtk.Label(label=conversation.title)
         title.set_halign(Gtk.Align.START)
-        title.set_ellipsize(True)
-        title.set_markup(f"<span font='11500' weight='600'>{conversation.title}</span>")
+        title.set_ellipsize(Pango.EllipsizeMode.END)
+        title.set_markup(f"<span size='10500' weight='600'>{conversation.title}</span>")
         title.set_margin_start(10)
-        title.set_margin_end(10)
-        title.set_margin_top(8)
-        self.add(title)
+        title.set_margin_end(4)
+        title.set_margin_top(6)
+        title.set_margin_bottom(6)
+        row.pack_start(title, True, True, 0)
         
-        # Timestamp
-        timestamp_str = conversation.updated_at.strftime("%a %H:%M")
+        # Timestamp - fixed width, no shrink
+        timestamp_str = conversation.updated_at.strftime("%H:%M")
         subtitle = Gtk.Label(label=timestamp_str)
-        subtitle.set_halign(Gtk.Align.START)
-        subtitle.set_ellipsize(True)
-        subtitle.set_markup(f"<span size='9500' foreground='#808080'>{timestamp_str}</span>")
-        subtitle.set_margin_start(10)
-        subtitle.set_margin_end(10)
+        subtitle.set_halign(Gtk.Align.END)
+        subtitle.set_ellipsize(Pango.EllipsizeMode.END)
+        subtitle.set_markup(f"<span size='9000' foreground='#808080'>{timestamp_str}</span>")
+        subtitle.set_margin_end(4)
+        subtitle.set_margin_top(6)
         subtitle.set_margin_bottom(6)
-        self.add(subtitle)
+        row.pack_end(subtitle, False, False, 0)
         
-        # Make clickable
+        # Delete button
+        if on_delete:
+            del_btn = Gtk.Button()
+            del_btn.set_relief(Gtk.ReliefStyle.NONE)
+            del_btn.set_tooltip_text("Delete conversation")
+            del_img = Gtk.Image.new_from_icon_name(
+                "user-trash-symbolic", Gtk.IconSize.MENU
+            )
+            del_btn.set_image(del_img)
+            del_btn.get_style_context().add_class("conversation-delete-btn")
+            del_btn.connect(
+                "clicked",
+                lambda b: on_delete(conversation),
+            )
+            row.pack_end(del_btn, False, False, 0)
+        
+        self.add(row)
+        
+        # EventBox receives button events (Box doesn't have its own GdkWindow)
         self.connect("button-press-event", lambda _, event: on_select(conversation) or False)
         self.show_all()  # Ensure all children are visible
 
@@ -59,9 +87,12 @@ class ConversationItem(Gtk.Box):
         Args:
             active: Whether the item should be highlighted as active.
         """
-        # In GTK3, simple styling is applied via CSS
-        # We'll keep the data internally but skip adding CSS classes
         self.active = active
+        ctx = self.get_style_context()
+        if active:
+            ctx.add_class("active")
+        else:
+            ctx.remove_class("active")
 
 
 class Sidebar(Gtk.Box):
@@ -71,6 +102,7 @@ class Sidebar(Gtk.Box):
         """Initialize the sidebar."""
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         self.set_size_request(240, -1)
+        self.get_style_context().add_class("sidebar")
         
         # Header with logo/app name
         header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
@@ -110,16 +142,6 @@ class Sidebar(Gtk.Box):
         
         self.add(search_box)
         
-        # New chat button
-        self.new_chat_button = Gtk.Button(label="+ New Chat")
-        self.new_chat_button.set_margin_start(12)
-        self.new_chat_button.set_margin_end(12)
-        self.new_chat_button.set_margin_top(4)
-        self.new_chat_button.set_margin_bottom(12)
-        self.new_chat_button.set_size_request(-1, 40)
-        self.new_chat_button.get_style_context().add_class("primary")
-        self.add(self.new_chat_button)
-        
         # Separator
         sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
         self.add(sep)
@@ -134,8 +156,18 @@ class Sidebar(Gtk.Box):
         self.conversations_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         self.conversations_box.set_margin_start(0)
         self.conversations_box.set_margin_end(0)
-        scrolled.add(self.conversations_box)
+        scrolled.add_with_viewport(self.conversations_box)
         self.add(scrolled)
+        
+        # New chat button - below conversation list
+        self.new_chat_button = Gtk.Button(label="+ New Chat")
+        self.new_chat_button.set_margin_start(12)
+        self.new_chat_button.set_margin_end(12)
+        self.new_chat_button.set_margin_top(8)
+        self.new_chat_button.set_margin_bottom(8)
+        self.new_chat_button.set_size_request(-1, 36)
+        self.new_chat_button.get_style_context().add_class("primary")
+        self.add(self.new_chat_button)
         
         # Footer with settings and status
         footer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
@@ -150,10 +182,11 @@ class Sidebar(Gtk.Box):
         
         footer_controls = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         
-        settings_btn = Gtk.Button()
-        settings_icon = Gtk.Image.new_from_icon_name("system-run-symbolic", Gtk.IconSize.BUTTON)
-        settings_btn.set_image(settings_icon)
-        footer_controls.add(settings_btn)
+        self.settings_btn = Gtk.Button()
+        settings_icon = Gtk.Image.new_from_icon_name("emblem-system-symbolic", Gtk.IconSize.BUTTON)
+        self.settings_btn.set_image(settings_icon)
+        self.settings_btn.set_tooltip_text("Settings")
+        footer_controls.add(self.settings_btn)
         
         status = Gtk.Label(label="Connected")
         footer_controls.add(status)
@@ -164,6 +197,7 @@ class Sidebar(Gtk.Box):
         self._conversations = {}
         self._current_active = None
         self.on_conversation_selected = None
+        self.on_conversation_delete = None
 
     def add_conversation(self, conversation: Conversation) -> None:
         """Add a conversation to the list.
@@ -171,7 +205,11 @@ class Sidebar(Gtk.Box):
         Args:
             conversation: The conversation to add.
         """
-        item = ConversationItem(conversation, self._on_conversation_selected)
+        item = ConversationItem(
+            conversation,
+            self._on_conversation_selected,
+            self._on_conversation_delete,
+        )
         self.conversations_box.add(item)
         item.show_all()  # Show the conversation item after adding it
         self._conversations[conversation.id] = (item, conversation)
@@ -211,6 +249,15 @@ class Sidebar(Gtk.Box):
         self.set_active_conversation(conversation.id)
         if self.on_conversation_selected:
             self.on_conversation_selected(conversation)
+
+    def _on_conversation_delete(self, conversation: Conversation) -> None:
+        """Handle conversation delete request.
+        
+        Args:
+            conversation: The conversation to delete.
+        """
+        if self.on_conversation_delete:
+            self.on_conversation_delete(conversation)
 
     def get_conversations(self) -> list[Conversation]:
         """Get all conversations in the sidebar.

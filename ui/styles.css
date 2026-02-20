@@ -15,9 +15,9 @@
 @define-color user-bubble #1E3A5F;
 @define-color assistant-bubble #2A1F4D;
 
-/* Global Styles */
+/* Global Styles - Do NOT use background-color on * as it creates black boxes on labels,
+   boxes, viewports and other widgets that should be transparent */
 * {
-  background-color: @bg-primary;
   color: @text-primary;
   font-family: "Ubuntu", "Cantarell", sans-serif;
   font-size: 13px;
@@ -91,6 +91,19 @@ button.primary:active {
   opacity: 0.9;
 }
 
+/* Tool chips (MCP tools bar) */
+button.tool-chip {
+  padding: 4px 10px;
+  font-size: 11px;
+  min-height: 0;
+}
+
+button.tool-chip:checked {
+  background-color: rgba(0, 217, 255, 0.2);
+  border-color: @primary-accent;
+  color: @primary-accent;
+}
+
 /* Scrollbars */
 scrollbar {
   background-color: transparent;
@@ -150,6 +163,34 @@ separator {
   padding: 12px 16px;
   border-radius: 12px;
   border-left: 3px solid @secondary-accent;
+}
+
+/* Thinking section (ChatGPT/DeepSeek style) - collapsible reasoning */
+.thinking-section {
+  margin-bottom: 12px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid rgba(128, 128, 128, 0.3);
+}
+
+.thinking-content {
+  padding: 8px 0;
+  background-color: rgba(0, 0, 0, 0.15);
+  border-radius: 6px;
+  padding: 10px 12px;
+}
+
+.thinking-toggle {
+  background-color: transparent;
+  border: none;
+  color: @text-tertiary;
+  padding: 2px;
+  min-width: 24px;
+  min-height: 24px;
+}
+
+.thinking-toggle:hover {
+  background-color: rgba(128, 128, 128, 0.2);
+  border-radius: 4px;
 }
 
 .message-timestamp {
@@ -213,9 +254,10 @@ separator {
 }
 
 .conversation-item {
-  padding: 12px 14px;
+  padding: 4px 10px;
+  min-height: 28px;
   border-left: 3px solid transparent;
-  margin: 4px 8px;
+  margin: 2px 8px;
   border-radius: 4px;
   transition: all 150ms;
 }
@@ -228,6 +270,17 @@ separator {
 .conversation-item.active {
   background-color: rgba(0, 217, 255, 0.15);
   border-left-color: @primary-accent;
+}
+
+.conversation-delete-btn {
+  opacity: 0.5;
+  padding: 2px;
+  min-width: 20px;
+  min-height: 20px;
+}
+
+.conversation-delete-btn:hover {
+  opacity: 1;
 }
 
 .conversation-title {

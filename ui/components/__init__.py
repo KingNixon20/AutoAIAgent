@@ -6,6 +6,7 @@ from ui.components.chat_input import ChatInput
 from ui.components.chat_area import ChatArea
 from ui.components.sidebar import Sidebar, ConversationItem
 from ui.components.settings_panel import SettingsPanel
+from ui.components.tools_bar import ToolsBar
 
 __all__ = [
     "MessageBubble",
@@ -15,4 +16,5 @@ __all__ = [
     "Sidebar",
     "ConversationItem",
     "SettingsPanel",
+    "ToolsBar",
 ]

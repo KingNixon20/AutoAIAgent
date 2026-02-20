@@ -1,5 +1,9 @@
 """
 LM Studio API client for chat completions.
+
+Tool support: Include tools and tool_choice in each request for the model
+to call tools. MCP/config lives in LM Studio; tool schemas must be sent
+with every request if you want them usable.
 """
 import asyncio
 import json
@@ -102,15 +106,29 @@ class LMStudioClient:
         Raises:
             ConnectionError: If unable to connect to LM Studio.
         """
-        if not self._is_connected:
-            await self.check_connection()
-            if not self._is_connected:
-                raise ConnectionError(f"Cannot reach LM Studio at {self.endpoint}")
+        # Use fresh session - safe when called from different event loop (e.g. background thread)
+        session = aiohttp.ClientSession()
 
+        # Check connection with this session
+        try:
+            async with session.get(
+                f"{self.endpoint}{C.API_MODELS}",
+                timeout=aiohttp.ClientTimeout(total=5),
+            ) as resp:
+                if resp.status != 200:
+                    await session.close()
+                    raise ConnectionError(f"Cannot reach LM Studio at {self.endpoint}")
+        except Exception as e:
+            await session.close()
+            raise ConnectionError(f"Cannot reach LM Studio: {e}") from e
+
+        # Full conversation context for AI memory - all prior messages + current
         messages = conversation.get_context_window()
         # Add system prompt if not already present
         if messages and messages[0]["role"] != "system":
             messages.insert(0, {"role": "system", "content": settings.system_prompt})
+
+        logger.info("Sending %d messages (context + current) to API", len(messages))
 
         payload = {
             "model": conversation.model,
@@ -120,7 +138,7 @@ class LMStudioClient:
         }
 
         try:
-            async with self.session.post(
+            async with session.post(
                 f"{self.endpoint}{C.API_CHAT_COMPLETIONS}",
                 json=payload,
                 timeout=aiohttp.ClientTimeout(total=C.API_TIMEOUT),
@@ -148,12 +166,13 @@ class LMStudioClient:
                         except json.JSONDecodeError:
                             logger.warning(f"Failed to decode JSON: {data_str}")
                             continue
-
         except asyncio.TimeoutError:
             raise LMStudioError("API request timed out")
         except Exception as e:
             logger.error(f"Chat completion error: {e}")
             raise
+        finally:
+            await session.close()
 
     async def count_tokens(self, text: str) -> int:
         """Estimate token count (rough estimation based on text length).

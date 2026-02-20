@@ -1,22 +1,29 @@
 """
 Main application window orchestrating all UI components.
 """
+import logging
+import threading
 import uuid
 import asyncio
-import gi
-from datetime import datetime
+from dataclasses import replace
 from typing import Optional
+
+import gi
 
 gi.require_version("Gtk", "3.0")
 from gi.repository import Gtk, Gio, GLib, Gdk
 
 from models import Message, MessageRole, Conversation, ConversationSettings
 from api import LMStudioClient
+from storage import load_conversations, load_tools, load_mcp_servers, save_conversations
+
+logger = logging.getLogger(__name__)
 from ui.components import (
     ChatArea,
     ChatInput,
     Sidebar,
     SettingsPanel,
+    ToolsBar,
 )
 import constants as C
 
@@ -61,7 +68,9 @@ class MainWindow(Gtk.ApplicationWindow):
         # Sidebar
         self.sidebar = Sidebar()
         self.sidebar.new_chat_button.connect("clicked", self._on_new_chat)
+        self.sidebar.settings_btn.connect("clicked", self._on_toggle_settings)
         self.sidebar.on_conversation_selected = self._on_conversation_selected
+        self.sidebar.on_conversation_delete = self._on_delete_conversation
 
         # Center: Chat area - constrain width for improved readability
         center_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
@@ -70,6 +79,11 @@ class MainWindow(Gtk.ApplicationWindow):
 
         self.chat_area = ChatArea()
         center_box.pack_start(self.chat_area, True, True, 0)
+
+        # Tools bar (MCP tools above input)
+        mcp_servers = load_mcp_servers()
+        self.tools_bar = ToolsBar(mcp_servers)
+        center_box.pack_end(self.tools_bar, False, False, 0)
 
         # Input area
         self.chat_input = ChatInput()
@@ -85,6 +99,7 @@ class MainWindow(Gtk.ApplicationWindow):
         # Settings panel (collapsible right side)
         self.settings_panel = SettingsPanel()
         self.settings_panel.set_no_show_all(True)
+        self.settings_panel.close_btn.connect("clicked", lambda *_: self.settings_panel.set_visible(False))
 
         main_box.pack_start(paned, True, True, 0)
         main_box.pack_end(self.settings_panel, False, False, 0)
@@ -92,35 +107,44 @@ class MainWindow(Gtk.ApplicationWindow):
         self.add(main_box)
         self.show_all()
         
-        # Initialize conversations
-        self._create_sample_conversations()
+        # Initialize conversations - load saved or create sample
+        self._load_or_create_conversations()
         
         # Setup keyboard shortcuts
         self._setup_shortcuts()
 
-    def _create_sample_conversations(self) -> None:
-        """Create sample conversations for testing."""
-        # Sample conversation
-        conv2 = Conversation(
-            id=str(uuid.uuid4()),
-            title="GTK UI Design",
-            model="llama2-7b"
-        )
-        conv2.add_message(Message(
-            id=str(uuid.uuid4()),
-            role=MessageRole.USER,
-            content="What are the best practices for GTK4 UI design?"
-        ))
-        conv2.add_message(Message(
-            id=str(uuid.uuid4()),
-            role=MessageRole.ASSISTANT,
-            content="GTK4 emphasizes modern design principles. Key practices include:\n\n- Use CSS for styling and theming\n- Leverage hardware acceleration\n- Design responsive layouts\n- Follow GNOME design guidelines\n- Use reactive programming patterns"
-        ))
-        self.conversations[conv2.id] = conv2
-        self.sidebar.add_conversation(conv2)
-        
-        # Load sample conversation
-        self._load_conversation(conv2.id)
+    def _load_or_create_conversations(self) -> None:
+        """Load saved conversations from disk, or create a sample if none exist."""
+        saved = load_conversations()
+        if saved:
+            for conv in saved:
+                self.conversations[conv.id] = conv
+                self.sidebar.add_conversation(conv)
+            # Load the most recently updated conversation
+            latest = max(saved, key=lambda c: c.updated_at)
+            self._load_conversation(latest.id)
+            logger.info(f"Loaded {len(saved)} saved conversation(s)")
+        else:
+            # Create sample conversation
+            conv = Conversation(
+                id=str(uuid.uuid4()),
+                title="GTK UI Design",
+                model="llama2-7b"
+            )
+            conv.add_message(Message(
+                id=str(uuid.uuid4()),
+                role=MessageRole.USER,
+                content="What are the best practices for GTK4 UI design?"
+            ))
+            conv.add_message(Message(
+                id=str(uuid.uuid4()),
+                role=MessageRole.ASSISTANT,
+                content="GTK4 emphasizes modern design principles. Key practices include:\n\n- Use CSS for styling and theming\n- Leverage hardware acceleration\n- Design responsive layouts\n- Follow GNOME design guidelines\n- Use reactive programming patterns"
+            ))
+            self.conversations[conv.id] = conv
+            self.sidebar.add_conversation(conv)
+            self._load_conversation(conv.id)
+            self._save_conversations()
 
     def _load_conversation(self, conversation_id: str) -> None:
         """Load a conversation into the chat area.
@@ -142,6 +166,48 @@ class MainWindow(Gtk.ApplicationWindow):
         """
         self._load_conversation(conversation.id)
 
+    def _on_delete_conversation(self, conversation: Conversation) -> None:
+        """Handle conversation delete request with confirmation."""
+        dialog = Gtk.MessageDialog(
+            transient_for=self,
+            flags=0,
+            message_type=Gtk.MessageType.QUESTION,
+            buttons=Gtk.ButtonsType.OK_CANCEL,
+            text="Delete conversation?",
+        )
+        dialog.format_secondary_text(
+            f'"{conversation.title}" and all its messages will be permanently deleted.'
+        )
+        response = dialog.run()
+        dialog.destroy()
+        if response != Gtk.ResponseType.OK:
+            return
+        conv_id = conversation.id
+        self.sidebar.remove_conversation(conv_id)
+        del self.conversations[conv_id]
+        self._save_conversations()
+        if self.current_conversation and self.current_conversation.id == conv_id:
+            remaining = list(self.conversations.values())
+            if remaining:
+                next_conv = max(remaining, key=lambda c: c.updated_at)
+                self._load_conversation(next_conv.id)
+            else:
+                self.current_conversation = None
+                self.chat_area.clear()
+                self.chat_area._title_label.set_label("New Conversation")
+                self.chat_area._subtitle_label.set_label("")
+
+    def _on_toggle_settings(self, button) -> None:
+        """Toggle settings panel visibility."""
+        visible = self.settings_panel.get_visible()
+        self.settings_panel.set_visible(not visible)
+        if not visible:
+            self.settings_panel.show_all()
+
+    def _save_conversations(self) -> None:
+        """Persist all conversations to disk."""
+        save_conversations(list(self.conversations.values()))
+
     def _on_new_chat(self, button) -> None:
         """Create a new conversation.
         
@@ -157,6 +223,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self.conversations[new_id] = new_conv
         self.sidebar.add_conversation(new_conv)
         self._load_conversation(new_id)
+        self._save_conversations()
 
     def _on_send_message(self, button) -> None:
         """Handle message sending.
@@ -171,6 +238,8 @@ class MainWindow(Gtk.ApplicationWindow):
         if not text:
             return
         
+        logger.info("User: %s", text)
+        
         # Add user message
         user_msg = Message(
             id=str(uuid.uuid4()),
@@ -180,6 +249,7 @@ class MainWindow(Gtk.ApplicationWindow):
         )
         self.current_conversation.add_message(user_msg)
         self.chat_area.add_message(user_msg)
+        self._save_conversations()
         
         # Clear input
         self.chat_input.clear()
@@ -187,39 +257,97 @@ class MainWindow(Gtk.ApplicationWindow):
         # Show typing indicator
         self.chat_area.show_typing_indicator()
         
-        # Simulate AI response (in real app, connect to API)
-        GLib.timeout_add(800, self._simulate_ai_response)
+        # Capture conversation for this request - ensures full context is sent
+        # even if user switches conversations before response arrives
+        conv = self.current_conversation
+        conv_id = conv.id
+        threading.Thread(
+            target=self._fetch_ai_response,
+            args=(text, conv, conv_id),
+            daemon=True,
+        ).start()
 
-    def _simulate_ai_response(self) -> bool:
-        """Simulate AI response (placeholder for API integration).
+    def _fetch_ai_response(
+        self, user_text: str, conversation: Conversation, conversation_id: str
+    ) -> None:
+        """Fetch AI response from API (runs in background thread).
         
-        Returns:
-            False to stop timeout.
+        Uses the captured conversation so full context (all prior messages)
+        is always sent to the API for memory.
         """
-        if not self.current_conversation:
+        response_text = None
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                response_text = loop.run_until_complete(
+                    self._get_api_response(conversation)
+                )
+            finally:
+                loop.close()
+        except Exception as e:
+            logger.warning("API request failed, using fallback: %s", e)
+        
+        if response_text is None:
+            import random
+            responses = [
+                "That's a great question! Let me think about that...",
+                "I understand. Here's what I think about that topic.",
+                "Interesting point. In my experience, the key considerations are:",
+                "I can help with that. Let me break it down for you.",
+            ]
+            response_text = random.choice(responses)
+        
+        logger.info("Assistant: %s", response_text)
+        
+        # Update UI on main thread - pass conv id so we add to correct conversation
+        GLib.idle_add(
+            self._add_assistant_message_and_save,
+            response_text,
+            conversation_id,
+            priority=GLib.PRIORITY_DEFAULT,
+        )
+
+    async def _get_api_response(self, conversation: Conversation) -> Optional[str]:
+        """Call LM Studio API with full conversation context for memory."""
+        if not conversation or not self.api_client.is_connected:
+            return None
+        settings = self.settings
+        tools, tool_choice = load_tools()
+        if tools is not None:
+            settings = replace(
+                settings, tools=tools, tool_choice=tool_choice
+            )
+        enabled_mcp = self.tools_bar.get_enabled_tools()
+        if enabled_mcp:
+            settings = replace(settings, integrations=enabled_mcp)
+        chunks = []
+        async for chunk in self.api_client.chat_completion(
+            conversation, settings
+        ):
+            chunks.append(chunk)
+        return "".join(chunks) if chunks else None
+
+    def _add_assistant_message_and_save(
+        self, response_text: str, conversation_id: str
+    ) -> bool:
+        """Add assistant message to UI and save (runs on main thread)."""
+        if conversation_id not in self.conversations:
             return False
-        
+        conv = self.conversations[conversation_id]
         self.chat_area.hide_typing_indicator()
-        
-        # Create a sample response
-        responses = [
-            "That's a great question! Let me think about that...",
-            "I understand. Here's what I think about that topic.",
-            "Interesting point. In my experience, the key considerations are:",
-            "I can help with that. Let me break it down for you.",
-        ]
-        
-        import random
         ai_msg = Message(
             id=str(uuid.uuid4()),
             role=MessageRole.ASSISTANT,
-            content=random.choice(responses),
+            content=response_text,
             tokens=50
         )
-        self.current_conversation.add_message(ai_msg)
-        self.chat_area.add_message(ai_msg)
-        
-        return False
+        conv.add_message(ai_msg)
+        if self.current_conversation and self.current_conversation.id == conversation_id:
+            self.current_conversation = conv
+            self.chat_area.add_message(ai_msg)
+        self._save_conversations()
+        return False  # Don't reschedule idle
 
     def _setup_shortcuts(self) -> None:
         """Setup keyboard shortcuts."""

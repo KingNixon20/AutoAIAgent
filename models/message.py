@@ -1,10 +1,16 @@
 """
 Data models for conversations and messages.
+
+LM Studio is stateless: every request must include the full message history.
+Memory is entirely managed by the client. Each conversation has its own
+message list - never shared between chats.
 """
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
 from enum import Enum
+
+import constants as C
 
 
 class MessageRole(Enum):
@@ -48,11 +54,53 @@ class Conversation:
         """Get the last message in the conversation."""
         return self.messages[-1] if self.messages else None
 
-    def get_context_window(self) -> list[dict]:
-        """Convert messages to OpenAI API format."""
-        return [
+    def _estimate_tokens(self, text: str) -> int:
+        """Rough token estimate (~4 chars per token)."""
+        return max(1, len(text) // C.CHARS_PER_TOKEN_EST)
+
+    def estimate_context_tokens(self) -> int:
+        """Estimate total tokens for all messages in this conversation."""
+        return sum(
+            msg.tokens if msg.tokens > 0 else self._estimate_tokens(msg.content)
+            for msg in self.messages
+        )
+
+    def get_context_window(self, max_tokens: Optional[int] = None) -> list[dict]:
+        """Convert message history to OpenAI/LM Studio API format.
+        
+        LM Studio is stateless: the full messages array is sent with every request.
+        System prompt is added separately by the API client.
+        
+        If max_tokens is set and history exceeds it, applies sliding window:
+        keeps the most recent exchanges. Never removes the system prompt
+        (that is added by the caller).
+        """
+        messages = [
             {"role": msg.role.value, "content": msg.content}
             for msg in self.messages
+        ]
+        if max_tokens is None:
+            return messages
+
+        estimated = self.estimate_context_tokens()
+        if estimated <= max_tokens:
+            return messages
+
+        # Sliding window: keep most recent exchanges, drop oldest
+        total = 0
+        keep_from = len(self.messages)
+        for i in range(len(self.messages) - 1, -1, -1):
+            msg = self.messages[i]
+            tokens = msg.tokens if msg.tokens > 0 else self._estimate_tokens(msg.content)
+            if total + tokens > max_tokens and total > 0:
+                keep_from = i + 1
+                break
+            total += tokens
+            keep_from = i
+
+        return [
+            {"role": msg.role.value, "content": msg.content}
+            for msg in self.messages[keep_from:]
         ]
 
 
@@ -64,12 +112,22 @@ class ConversationSettings:
     top_p: float = 0.95
     repetition_penalty: float = 1.0
     system_prompt: str = "You are a helpful AI assistant."
+    tools: Optional[list] = None
+    tool_choice: Optional[object] = None
+    integrations: Optional[list[str]] = None  # MCP server ids e.g. ["mcp/playwright"]
 
     def to_dict(self) -> dict:
         """Convert to API request parameters."""
-        return {
+        d = {
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
             "top_p": self.top_p,
             "repetition_penalty": self.repetition_penalty,
         }
+        if self.tools:
+            d["tools"] = self.tools
+        if self.tool_choice is not None:
+            d["tool_choice"] = self.tool_choice
+        if self.integrations:
+            d["integrations"] = self.integrations
+        return d

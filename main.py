@@ -4,9 +4,18 @@ AutoAIAgent - Premium GTK3 AI Chat Client
 
 A beautiful, dark-themed desktop application for chatting with locally running LM Studio.
 """
+import logging
 import sys
 import asyncio
 import gi
+
+# Configure logging to terminal
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+    stream=sys.stdout,
+)
 
 gi.require_version("Gtk", "3.0")
 from gi.repository import Gtk, Gio, GLib, Gdk

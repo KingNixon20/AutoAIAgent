@@ -103,6 +103,11 @@ TYPING_DOT_COLORS = [COLOR_ACCENT_SECONDARY, COLOR_ACCENT_SECONDARY, COLOR_ACCEN
 TYPING_ANIMATION_DURATION = 1400  # ms
 TYPING_DOT_DELAY = 280  # ms between dots
 
+# Context window - models have limits (e.g. 4K, 8K, 32K tokens)
+CONTEXT_WINDOW_MAX = 8192
+CONTEXT_TRIM_THRESHOLD = 0.85  # Trim when usage exceeds 85% of max
+CHARS_PER_TOKEN_EST = 4  # Rough estimate for token counting
+
 # API
 API_ENDPOINT_DEFAULT = "http://localhost:1234/v1"
 API_CHAT_COMPLETIONS = "/chat/completions"

@@ -49,6 +49,8 @@ class ChatArea(Gtk.Box):
         
         self.messages_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         self.messages_box.set_homogeneous(False)
+        self.messages_box.set_hexpand(True)
+        self.messages_box.set_size_request(400, -1)  # Min width to prevent shrinking
         
         scrolled.add(self.messages_box)
         self.add(scrolled)
@@ -66,6 +68,9 @@ class ChatArea(Gtk.Box):
         # Clear existing messages
         for child in list(self.messages_box.get_children()):
             self.messages_box.remove(child)
+        self._typing_shown = False
+        if hasattr(self, "_typing_indicator_widget"):
+            del self._typing_indicator_widget
         
         # Update header
         self._title_label.set_label(conversation.title)
@@ -104,18 +109,17 @@ class ChatArea(Gtk.Box):
         """Show the typing indicator."""
         if not self._typing_shown:
             indicator = TypingIndicator()
+            self._typing_indicator_widget = indicator
             self.messages_box.add(indicator)
             self._typing_shown = True
             GLib.idle_add(self._scroll_to_bottom)
 
     def hide_typing_indicator(self) -> None:
         """Hide the typing indicator."""
-        if self._typing_shown:
-            # Remove last child if it's the typing indicator
-            last_child = self.messages_box.get_last_child()
-            if last_child and "typing-indicator" in last_child.get_css_classes():
-                self.messages_box.remove(last_child)
-            self._typing_shown = False
+        if self._typing_shown and hasattr(self, "_typing_indicator_widget"):
+            self.messages_box.remove(self._typing_indicator_widget)
+            del self._typing_indicator_widget
+        self._typing_shown = False
 
     def clear(self) -> None:
         """Clear all messages from the display."""
@@ -123,6 +127,8 @@ class ChatArea(Gtk.Box):
             self.messages_box.remove(child)
         self._last_date = None
         self._typing_shown = False
+        if hasattr(self, "_typing_indicator_widget"):
+            del self._typing_indicator_widget
 
     def _add_date_separator(self, date) -> None:
         """Add a date separator to the display.

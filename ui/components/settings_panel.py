@@ -17,6 +17,7 @@ class SettingsPanel(Gtk.Box):
         """Initialize the settings panel."""
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         self.set_size_request(280, -1)
+        self.get_style_context().add_class("settings-panel")
         
         # Header with close button
         header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
@@ -31,11 +32,12 @@ class SettingsPanel(Gtk.Box):
         title.set_halign(Gtk.Align.START)
         header.pack_start(title, True, True, 0)
         
-        close_btn = Gtk.Button()
+        self.close_btn = Gtk.Button()
         close_icon = Gtk.Image.new_from_icon_name("window-close-symbolic", Gtk.IconSize.BUTTON)
-        close_btn.set_image(close_icon)
-        close_btn.set_halign(Gtk.Align.END)
-        header.pack_end(close_btn, False, False, 0)
+        self.close_btn.set_image(close_icon)
+        self.close_btn.set_halign(Gtk.Align.END)
+        self.close_btn.set_tooltip_text("Close settings")
+        header.pack_end(self.close_btn, False, False, 0)
         
         self.add(header)
         
