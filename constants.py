@@ -44,8 +44,8 @@ SPACING_LG = 16
 SPACING_XL = 24
 
 # Sizes
-SIDEBAR_WIDTH = 200
-SETTINGS_PANEL_WIDTH = 280
+SIDEBAR_WIDTH = 240
+SETTINGS_PANEL_WIDTH = 420
 CHAT_MAX_WIDTH = 900  # Max width for message area
 
 BUTTON_HEIGHT = 44
@@ -74,10 +74,24 @@ Z_OVERLAY = 100
 Z_MODAL = 1000
 
 # Layout dimensions
-WINDOW_MIN_WIDTH = 1280
-WINDOW_MIN_HEIGHT = 720
-WINDOW_DEFAULT_WIDTH = 1600
-WINDOW_DEFAULT_HEIGHT = 900
+WINDOW_MIN_WIDTH = 600
+WINDOW_MIN_HEIGHT = 420
+WINDOW_DEFAULT_WIDTH = 960
+WINDOW_DEFAULT_HEIGHT = 600
+WINDOW_MAX_WIDTH = 2560
+WINDOW_MAX_HEIGHT = 1440
+
+# Default ratios for responsive layout
+# Fraction of screen to use for default window size (0.0 - 1.0)
+# Default window uses 45% of screen to avoid overly large startup windows
+WINDOW_DEFAULT_RATIO = 0.45
+# Fraction of screen width to allocate to the sidebar by default
+DEFAULT_SIDEBAR_RATIO = 0.35
+
+# Optional fixed startup window size (pixels). If set, these override the
+# responsive WINDOW_DEFAULT_RATIO behavior but are still clamped to min/max.
+WINDOW_START_WIDTH = 1390
+WINDOW_START_HEIGHT = 740
 
 # Message bubble
 MESSAGE_BUBBLE_PADDING = SPACING_MD
@@ -121,3 +135,5 @@ DEFAULT_MAX_TOKENS = 2048
 DEFAULT_TOP_P = 0.95
 DEFAULT_REPETITION_PENALTY = 1.0
 DEFAULT_SYSTEM_PROMPT = "You are a helpful AI assistant."
+DEFAULT_CONTEXT_LIMIT = 4096  # Max tokens for conversation context
+DEFAULT_TOKEN_SAVER = False

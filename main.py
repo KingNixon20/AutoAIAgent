@@ -9,6 +9,13 @@ import sys
 import asyncio
 import gi
 
+import os
+
+# Optional backend override for debugging:
+# AUTOAI_FORCE_X11=1 python3 main.py
+if os.environ.get("AUTOAI_FORCE_X11") == "1":
+    os.environ["GDK_BACKEND"] = "x11"
+
 # Configure logging to terminal
 logging.basicConfig(
     level=logging.INFO,

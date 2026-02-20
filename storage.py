@@ -22,49 +22,193 @@ def _get_storage_path() -> str:
 
 
 def load_mcp_servers() -> list[dict]:
-    """Scan for LM Studio mcp.json and return available MCP servers and their calls.
+    """Scan MCP config files and return available MCP servers and their calls.
 
-    Searches common locations:
+    Searches locations (merged):
     - ~/.lmstudio/mcp.json (Linux/macOS)
     - %USERPROFILE%\\.lmstudio\\mcp.json (Windows)
+    - ~/.config/AutoAIAgent/mcp.json (app-local custom servers)
 
     Returns:
         List of dicts with keys: `id` (integration id), `name` (display name),
         `calls` (list of call names). Example:
         [{"id": "mcp/playwright", "name": "playwright", "calls": ["run", "status"]}]
     """
-    paths = [
-        os.path.join(os.path.expanduser("~"), ".lmstudio", "mcp.json"),
-    ]
-    if os.name == "nt":
-        paths.insert(0, os.path.join(os.environ.get("USERPROFILE", ""), ".lmstudio", "mcp.json"))
-    
-    for path in paths:
+    configs = load_mcp_server_configs()
+    result = []
+    for integration_id, item in configs.items():
+        cfg = item.get("config", {}) if isinstance(item, dict) else {}
+        calls = []
+        if isinstance(cfg, dict):
+            calls = cfg.get("calls") or cfg.get("actions") or []
+        result.append(
+            {
+                "id": integration_id,
+                "name": item.get("name") if isinstance(item, dict) else integration_id,
+                "calls": list(calls) if isinstance(calls, list) else [],
+            }
+        )
+    # Built-in local filesystem MCP-like integration (always available client-side).
+    result.append(
+        {
+            "id": "mcp/builtin_filesystem",
+            "name": "builtin_filesystem",
+            "calls": ["read_file", "write_file", "edit_file", "delete_file"],
+        }
+    )
+    return result
+
+
+def load_mcp_server_configs() -> dict[str, dict]:
+    """Load merged MCP server configs with full metadata.
+
+    Returns:
+        Dict keyed by integration id, value:
+        {
+          "id": "mcp/<name>",
+          "name": "<name>",
+          "config": {...},
+          "sources": ["lmstudio", "app"]
+        }
+    """
+    merged: dict[str, dict] = {}
+    for source, path in _iter_mcp_paths():
         if not path or not os.path.exists(path):
             continue
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             servers = data.get("mcpServers") or data.get("mcp_servers") or {}
-            result = []
+            if not isinstance(servers, dict):
+                continue
             for name, meta in servers.items():
-                if not name:
+                if not name or not isinstance(meta, dict):
                     continue
                 integration_id = f"mcp/{name}"
-                # Some MCP schemas may include a list of available calls/actions
-                calls = []
-                try:
-                    # server entry can be dict with metadata; look for 'calls' or 'actions'
-                    if isinstance(meta, dict):
-                        calls = meta.get("calls") or meta.get("actions") or []
-                    # otherwise ignore
-                except Exception:
-                    calls = []
-                result.append({"id": integration_id, "name": name, "calls": calls})
-            return result
+                existing = merged.get(integration_id)
+                if not existing:
+                    merged[integration_id] = {
+                        "id": integration_id,
+                        "name": name,
+                        "config": dict(meta),
+                        "sources": [source],
+                    }
+                else:
+                    # Later sources override scalar fields, merge dict/list fields.
+                    existing_cfg = existing.get("config", {})
+                    _merge_mcp_dict(existing_cfg, meta)
+                    existing["config"] = existing_cfg
+                    sources = existing.get("sources", [])
+                    if source not in sources:
+                        sources.append(source)
+                        existing["sources"] = sources
         except (json.JSONDecodeError, IOError, AttributeError):
             continue
-    return []
+    return merged
+
+
+def _iter_mcp_paths() -> list[tuple[str, str]]:
+    """Yield MCP config sources in precedence order."""
+    paths: list[tuple[str, str]] = [
+        ("lmstudio", os.path.join(os.path.expanduser("~"), ".lmstudio", "mcp.json")),
+    ]
+    if os.name == "nt":
+        paths.insert(0, ("lmstudio", os.path.join(os.environ.get("USERPROFILE", ""), ".lmstudio", "mcp.json")))
+    paths.append(("app", os.path.join(_get_config_dir(), "mcp.json")))
+    return paths
+
+
+def _merge_mcp_dict(base: dict, incoming: dict) -> None:
+    """Merge incoming MCP config into base."""
+    for key, value in incoming.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            nested = base.get(key)
+            if isinstance(nested, dict):
+                _merge_mcp_dict(nested, value)
+        elif isinstance(value, list) and isinstance(base.get(key), list):
+            current = base.get(key) or []
+            seen = set(current)
+            for item in value:
+                if item not in seen:
+                    current.append(item)
+                    seen.add(item)
+            base[key] = current
+        else:
+            base[key] = value
+
+
+def save_app_mcp_server(server_name: str, server_config: dict) -> tuple[bool, str]:
+    """Save/update one MCP server entry in app-local mcp.json.
+
+    Args:
+        server_name: MCP server key name.
+        server_config: Dict for this server (url/command/args/env/etc).
+
+    Returns:
+        (ok, message)
+    """
+    name = (server_name or "").strip()
+    if not name:
+        return (False, "Server name is required.")
+
+    path = os.path.join(_get_config_dir(), "mcp.json")
+    data = {}
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, IOError):
+            data = {}
+
+    servers = data.get("mcpServers")
+    if not isinstance(servers, dict):
+        servers = {}
+    servers[name] = server_config
+    data["mcpServers"] = servers
+
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        return (True, f"Saved MCP server '{name}'.")
+    except IOError as e:
+        return (False, f"Failed to save MCP server: {e}")
+
+
+def load_app_mcp_servers() -> dict:
+    """Load app-local MCP servers from ~/.config/AutoAIAgent/mcp.json."""
+    path = os.path.join(_get_config_dir(), "mcp.json")
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        servers = data.get("mcpServers")
+        return servers if isinstance(servers, dict) else {}
+    except (json.JSONDecodeError, IOError):
+        return {}
+
+
+def delete_app_mcp_server(server_name: str) -> tuple[bool, str]:
+    """Delete one app-local MCP server by name."""
+    name = (server_name or "").strip()
+    if not name:
+        return (False, "Server name is required.")
+    path = os.path.join(_get_config_dir(), "mcp.json")
+    if not os.path.exists(path):
+        return (False, "No app-local mcp.json found.")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        servers = data.get("mcpServers")
+        if not isinstance(servers, dict) or name not in servers:
+            return (False, f"Server '{name}' not found.")
+        del servers[name]
+        data["mcpServers"] = servers
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        return (True, f"Deleted MCP server '{name}'.")
+    except (json.JSONDecodeError, IOError) as e:
+        return (False, f"Failed to delete MCP server: {e}")
 
 
 def load_tools() -> tuple[Optional[list], Optional[object]]:
@@ -93,13 +237,16 @@ def load_tools() -> tuple[Optional[list], Optional[object]]:
 
 def _message_to_dict(msg: Message) -> dict:
     """Serialize a Message to a JSON-serializable dict."""
-    return {
+    data = {
         "id": msg.id,
         "role": msg.role.value,
         "content": msg.content,
         "timestamp": msg.timestamp.isoformat(),
         "tokens": msg.tokens,
     }
+    if msg.meta is not None:
+        data["meta"] = msg.meta
+    return data
 
 
 def _message_from_dict(data: dict) -> Message:
@@ -110,12 +257,13 @@ def _message_from_dict(data: dict) -> Message:
         content=data["content"],
         timestamp=datetime.fromisoformat(data["timestamp"]),
         tokens=data.get("tokens", 0),
+        meta=data.get("meta"),
     )
 
 
 def _conversation_to_dict(conv: Conversation) -> dict:
     """Serialize a Conversation to a JSON-serializable dict."""
-    return {
+    data = {
         "id": conv.id,
         "title": conv.title,
         "model": conv.model,
@@ -123,7 +271,14 @@ def _conversation_to_dict(conv: Conversation) -> dict:
         "updated_at": conv.updated_at.isoformat(),
         "total_tokens": conv.total_tokens,
         "messages": [_message_to_dict(m) for m in conv.messages],
+        "ai_tasks": conv.ai_tasks if isinstance(conv.ai_tasks, list) else [],
+        "chat_mode": conv.chat_mode if str(getattr(conv, "chat_mode", "ask")) in ("ask", "plan", "agent") else "ask",
     }
+    if conv.chat_settings is not None:
+        data["chat_settings"] = conv.chat_settings
+    if isinstance(conv.agent_config, dict):
+        data["agent_config"] = conv.agent_config
+    return data
 
 
 def _conversation_from_dict(data: dict) -> Conversation:
@@ -135,6 +290,10 @@ def _conversation_from_dict(data: dict) -> Conversation:
         created_at=datetime.fromisoformat(data["created_at"]),
         updated_at=datetime.fromisoformat(data["updated_at"]),
         total_tokens=data.get("total_tokens", 0),
+        chat_settings=data.get("chat_settings"),
+        ai_tasks=data.get("ai_tasks") if isinstance(data.get("ai_tasks"), list) else [],
+        chat_mode=data.get("chat_mode") if str(data.get("chat_mode")) in ("ask", "plan", "agent") else "ask",
+        agent_config=data.get("agent_config") if isinstance(data.get("agent_config"), dict) else None,
     )
     for m_data in data.get("messages", []):
         conv.messages.append(_message_from_dict(m_data))

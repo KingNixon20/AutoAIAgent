@@ -10,7 +10,7 @@ from datetime import datetime
 from typing import Optional
 from enum import Enum
 
-import constants as C
+from token_counter import count_text_tokens
 
 
 class MessageRole(Enum):
@@ -28,6 +28,7 @@ class Message:
     content: str
     timestamp: datetime = field(default_factory=datetime.now)
     tokens: int = 0  # Approximate token count
+    meta: Optional[dict] = None
 
     def __str__(self) -> str:
         return f"{self.role.value}: {self.content[:50]}..."
@@ -43,9 +44,15 @@ class Conversation:
     updated_at: datetime = field(default_factory=datetime.now)
     model: str = "llama2-7b"
     total_tokens: int = 0
+    chat_settings: Optional[dict] = None  # Per-chat override settings
+    ai_tasks: list[dict] = field(default_factory=list)  # Planning tasks for this conversation
+    chat_mode: str = "ask"  # ask | plan | agent
+    agent_config: Optional[dict] = None  # {"project_name": str, "project_dir": str}
 
     def add_message(self, message: Message) -> None:
         """Add a message to the conversation."""
+        if message.tokens <= 0:
+            message.tokens = self._estimate_tokens(message.content, self.model)
         self.messages.append(message)
         self.updated_at = datetime.now()
         self.total_tokens += message.tokens
@@ -54,16 +61,20 @@ class Conversation:
         """Get the last message in the conversation."""
         return self.messages[-1] if self.messages else None
 
-    def _estimate_tokens(self, text: str) -> int:
-        """Rough token estimate (~4 chars per token)."""
-        return max(1, len(text) // C.CHARS_PER_TOKEN_EST)
+    def _estimate_tokens(self, text: str, model: Optional[str] = None) -> int:
+        """Tokenizer-based token count for a single message text."""
+        return count_text_tokens(text, model=model or self.model)
 
-    def estimate_context_tokens(self) -> int:
+    def estimate_context_tokens(self, model: Optional[str] = None) -> int:
         """Estimate total tokens for all messages in this conversation."""
-        return sum(
-            msg.tokens if msg.tokens > 0 else self._estimate_tokens(msg.content)
-            for msg in self.messages
-        )
+        target_model = model or self.model
+        total = 0
+        for msg in self.messages:
+            if msg.tokens <= 0:
+                msg.tokens = self._estimate_tokens(msg.content, target_model)
+            total += msg.tokens
+        self.total_tokens = total
+        return total
 
     def get_context_window(self, max_tokens: Optional[int] = None) -> list[dict]:
         """Convert message history to OpenAI/LM Studio API format.
@@ -82,7 +93,7 @@ class Conversation:
         if max_tokens is None:
             return messages
 
-        estimated = self.estimate_context_tokens()
+        estimated = self.estimate_context_tokens(model=self.model)
         if estimated <= max_tokens:
             return messages
 
@@ -91,7 +102,7 @@ class Conversation:
         keep_from = len(self.messages)
         for i in range(len(self.messages) - 1, -1, -1):
             msg = self.messages[i]
-            tokens = msg.tokens if msg.tokens > 0 else self._estimate_tokens(msg.content)
+            tokens = msg.tokens if msg.tokens > 0 else self._estimate_tokens(msg.content, self.model)
             if total + tokens > max_tokens and total > 0:
                 keep_from = i + 1
                 break
@@ -111,7 +122,14 @@ class ConversationSettings:
     max_tokens: int = 2048
     top_p: float = 0.95
     repetition_penalty: float = 1.0
+    presence_penalty: float = 0.0
+    frequency_penalty: float = 0.0
+    seed: Optional[int] = None
+    stop_sequences: Optional[list[str]] = None
     system_prompt: str = "You are a helpful AI assistant."
+    context_limit: int = 4096  # Max tokens allowed in conversation context
+    token_saver: bool = False  # Summarize history before each reply
+    auto_tool_approval: bool = False  # Skip manual tool permission prompts
     tools: Optional[list] = None
     tool_choice: Optional[object] = None
     integrations: Optional[list[str]] = None  # MCP server ids e.g. ["mcp/playwright"]
@@ -123,7 +141,13 @@ class ConversationSettings:
             "max_tokens": self.max_tokens,
             "top_p": self.top_p,
             "repetition_penalty": self.repetition_penalty,
+            "presence_penalty": self.presence_penalty,
+            "frequency_penalty": self.frequency_penalty,
         }
+        if self.seed is not None:
+            d["seed"] = self.seed
+        if self.stop_sequences:
+            d["stop"] = self.stop_sequences
         if self.tools:
             d["tools"] = self.tools
         if self.tool_choice is not None:
