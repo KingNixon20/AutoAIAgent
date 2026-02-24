@@ -1,8 +1,10 @@
 """
 Chat message display area widget.
 """
+import os
 import gi
 
+from typing import Callable, Optional
 gi.require_version("Gtk", "3.0")
 from gi.repository import Gtk, GLib
 
@@ -13,7 +15,10 @@ from ui.components.message_bubble import MessageBubble, TypingIndicator
 class ChatArea(Gtk.Box):
     """Displays chat messages in a scrollable area."""
 
-    def __init__(self):
+    def __init__(self,
+                 on_edit_message_request: Optional[Callable[[str], None]] = None,
+                 on_repush_message_request: Optional[Callable[[str], None]] = None,
+                 on_delete_message_request: Optional[Callable[[str], None]] = None):
         """Initialize the chat area."""
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=0)
 
@@ -27,6 +32,10 @@ class ChatArea(Gtk.Box):
         self._autoscroll_enabled = True
         self._autoscroll_pulses = 0
         self._autoscroll_source_id = None
+        
+        self.on_edit_message_request = on_edit_message_request
+        self.on_repush_message_request = on_repush_message_request
+        self.on_delete_message_request = on_delete_message_request
 
         # Chat header
         self.header_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
@@ -44,6 +53,15 @@ class ChatArea(Gtk.Box):
         title_label.set_xalign(0.0)
         title_label.set_markup("<span font='bold' size='13000'>New Conversation</span>")
         header_row.pack_start(title_label, True, True, 0)
+
+        self.open_dir_btn = Gtk.Button()
+        self.open_dir_btn.set_relief(Gtk.ReliefStyle.NORMAL)
+        self.open_dir_btn.set_tooltip_text("Open project directory")
+        self.open_dir_btn.set_no_show_all(True)
+        folder_icon = Gtk.Image.new_from_icon_name("folder-open-symbolic", Gtk.IconSize.BUTTON)
+        self.open_dir_btn.set_image(folder_icon)
+        self.open_dir_btn.connect("clicked", self._on_open_dir_clicked)
+        header_row.pack_end(self.open_dir_btn, False, False, 0)
 
         self.chat_settings_btn = Gtk.Button()
         self.chat_settings_btn.set_relief(Gtk.ReliefStyle.NORMAL)
@@ -113,10 +131,20 @@ class ChatArea(Gtk.Box):
         # Sync popover controls to current conversation
         self._load_chat_settings_into_ui()
 
+        # Show/hide open dir button based on agent_config
+        self._update_open_dir_button()
+
         # Add messages
         self._last_date = None
+        # Pre-calculate available width once for existing messages
+        total_horizontal_margins = 20 + 20 # MessageBubble's own margins
+        current_available_width = self.messages_box.get_allocated_width() - total_horizontal_margins
+        if current_available_width < 100:
+            current_available_width = 100
+
         for message in conversation.messages:
-            self.add_message(message, animate=False)
+            # Pass the calculated width to add_message
+            self.add_message(message, animate=False, max_content_width=current_available_width)
 
         # Auto scroll to bottom
         self._request_scroll_to_bottom(8)
@@ -126,12 +154,13 @@ class ChatArea(Gtk.Box):
         self._context_limit = context_limit
         self._update_subtitle()
 
-    def add_message(self, message: Message, animate: bool = True) -> None:
+    def add_message(self, message: Message, animate: bool = True, max_content_width: int = -1) -> None:
         """Add a message to the display.
 
         Args:
             message: The message to add.
             animate: Whether to animate the message appearance.
+            max_content_width: Optional. The maximum width for the message content.
         """
         # Add date separator if needed
         current_date = message.timestamp.date()
@@ -139,8 +168,22 @@ class ChatArea(Gtk.Box):
             self._add_date_separator(current_date)
             self._last_date = current_date
 
+        calculated_width = max_content_width
+        if calculated_width == -1: # If not passed, calculate it
+            # Account for MessageBubble's set_margin_start(20) and set_margin_end(20)
+            total_horizontal_margins = 20 + 20
+            calculated_width = self.messages_box.get_allocated_width() - total_horizontal_margins
+            if calculated_width < 100: # Ensure a minimum width
+                calculated_width = 100
+
         # Create and add message bubble
-        bubble = MessageBubble(message)
+        bubble = MessageBubble(
+            message,
+            on_edit_message=self.on_edit_message_request,
+            on_repush_message=self.on_repush_message_request,
+            on_delete_message=self.on_delete_message_request,
+            max_content_width=calculated_width,
+        )
         self.messages_box.add(bubble)
         bubble.show_all()  # Make sure message bubble is visible
 
@@ -449,9 +492,56 @@ class ChatArea(Gtk.Box):
     def _autoscroll_tick(self) -> bool:
         """Autoscroll tick; keeps following newest message until pulses exhaust."""
         adj = self.scrolled.get_vadjustment()
-        adj.set_value(adj.get_upper() - adj.get_page_size())
+        if adj: # Check if adjustment exists
+            adj.set_value(adj.get_upper() - adj.get_page_size())
         self._autoscroll_pulses -= 1
         if self._autoscroll_pulses > 0:
             return True
         self._autoscroll_source_id = None
         return False
+
+    def _update_open_dir_button(self) -> None:
+        """Show/hide the open dir button based on whether project directory exists."""
+        if not self._current_conversation:
+            self.open_dir_btn.hide()
+            return
+        
+        agent_config = self._current_conversation.agent_config
+        if agent_config and isinstance(agent_config, dict):
+            project_dir = agent_config.get("project_dir")
+            if project_dir and os.path.isdir(project_dir):
+                self.open_dir_btn.show()
+                self.open_dir_btn.set_tooltip_text(f"Open project directory: {project_dir}")
+                return
+        
+        self.open_dir_btn.hide()
+
+    def _on_open_dir_clicked(self, button) -> None:
+        """Open the project directory in the file browser."""
+        if not self._current_conversation:
+            return
+        
+        agent_config = self._current_conversation.agent_config
+        if not agent_config or not isinstance(agent_config, dict):
+            return
+        
+        project_dir = agent_config.get("project_dir")
+        if not project_dir or not os.path.isdir(project_dir):
+            return
+        
+        self._open_directory_in_file_browser(project_dir)
+
+    def _open_directory_in_file_browser(self, directory: str) -> None:
+        """Open a directory in the system file browser."""
+        import subprocess
+        import sys
+        
+        try:
+            if sys.platform == "darwin":  # macOS
+                subprocess.Popen(["open", directory])
+            elif sys.platform == "win32":  # Windows
+                subprocess.Popen(["explorer", directory])
+            else:  # Linux and other Unix-like systems
+                subprocess.Popen(["xdg-open", directory])
+        except Exception as e:
+            print(f"Failed to open directory: {e}")

@@ -483,3 +483,60 @@ button.send-button-small {
 }
 
 /* Animations - Limited support in GTK3 */
+/* Tool Event Details */
+.tool-event-detail {
+  background-color: @bg-secondary;
+  border: 1px solid @border-color;
+  border-radius: 8px;
+  padding: 10px;
+  margin-top: 8px;
+  margin-bottom: 8px;
+}
+
+.tool-event-error {
+  border-color: @error-color;
+  background-color: rgba(255, 82, 82, 0.1);
+}
+
+/* Markdown Renderer Specifics for Tool Output */
+.markdown-text-view {
+  background-color: @bg-primary; /* Use primary background for code blocks etc. */
+  border: 1px solid @border-color;
+  border-radius: 6px;
+  padding: 8px;
+  margin-top: 4px;
+}
+
+/* Diff Styling */
+.diff-plus {
+  background-color: rgba(0, 230, 118, 0.1); /* Light green for added lines */
+}
+
+.diff-minus {
+  background-color: rgba(255, 82, 82, 0.1); /* Light red for removed lines */
+}
+
+.diff-header {
+  color: @text-tertiary;
+}
+
+/* Message action buttons */
+.message-actions {
+  opacity: 1; /* Always visible */
+  transition: none; /* No transition for opacity change if always visible */
+}
+
+.message-action-button {
+  min-width: 18px;
+  min-height: 18px;
+  padding: 2px;
+  border-radius: 4px;
+  background-color: transparent;
+  border: none;
+  color: rgba(128, 128, 128, 0.6);
+}
+
+.message-action-button:hover {
+  background-color: rgba(128, 128, 128, 0.1);
+  color: @text-secondary;
+}

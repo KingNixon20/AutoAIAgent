@@ -48,6 +48,7 @@ class Conversation:
     ai_tasks: list[dict] = field(default_factory=list)  # Planning tasks for this conversation
     chat_mode: str = "ask"  # ask | plan | agent
     agent_config: Optional[dict] = None  # {"project_name": str, "project_dir": str}
+    active_context_files: dict[str, str] = field(default_factory=dict) # Files loaded for deep retrieval
 
     def add_message(self, message: Message) -> None:
         """Add a message to the conversation."""

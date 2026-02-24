@@ -273,6 +273,7 @@ def _conversation_to_dict(conv: Conversation) -> dict:
         "messages": [_message_to_dict(m) for m in conv.messages],
         "ai_tasks": conv.ai_tasks if isinstance(conv.ai_tasks, list) else [],
         "chat_mode": conv.chat_mode if str(getattr(conv, "chat_mode", "ask")) in ("ask", "plan", "agent") else "ask",
+        "active_context_files": conv.active_context_files if isinstance(conv.active_context_files, dict) else {},
     }
     if conv.chat_settings is not None:
         data["chat_settings"] = conv.chat_settings
@@ -294,6 +295,7 @@ def _conversation_from_dict(data: dict) -> Conversation:
         ai_tasks=data.get("ai_tasks") if isinstance(data.get("ai_tasks"), list) else [],
         chat_mode=data.get("chat_mode") if str(data.get("chat_mode")) in ("ask", "plan", "agent") else "ask",
         agent_config=data.get("agent_config") if isinstance(data.get("agent_config"), dict) else None,
+        active_context_files=data.get("active_context_files") if isinstance(data.get("active_context_files"), dict) else {},
     )
     for m_data in data.get("messages", []):
         conv.messages.append(_message_from_dict(m_data))
@@ -332,3 +334,18 @@ def save_conversations(conversations: list[Conversation]) -> None:
     }
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def append_file(file_path: str, content: str) -> None:
+    """Append content to a file."""
+    try:
+        with open(file_path, "a", encoding="utf-8") as f:
+            f.write(content)
+    except Exception as e:
+        print(f"Error appending to file {file_path}: {e}")
+        raise
+
+def write_file(file_path: str, content: str) -> None:
+    """Write content to a file."""
+    with open(file_path, "w", encoding="utf-8") as f:
+        f.write(content)

@@ -92,7 +92,18 @@ class ChatInput(Gtk.Box):
         self.status_label.set_halign(Gtk.Align.START)
         status_box.pack_start(self.status_label, False, False, 0)
         
+        # Refresh connection button (only shown when disconnected)
+        self.refresh_button = Gtk.Button()
+        refresh_icon = Gtk.Image.new_from_icon_name("view-refresh-symbolic", Gtk.IconSize.BUTTON)
+        self.refresh_button.set_image(refresh_icon)
+        self.refresh_button.set_tooltip_text("Retry connection to LM Studio")
+        self.refresh_button.set_relief(Gtk.ReliefStyle.NONE)
+        self.refresh_button.set_no_show_all(True)  # Hidden by default
+        self.refresh_button.hide()
+        status_box.pack_start(self.refresh_button, False, False, 0)
+        
         self._api_client = None
+        self._refresh_callback = None
         
         # Autoscroll checkbox on the right side
         spacer = Gtk.Box()
@@ -126,6 +137,14 @@ class ChatInput(Gtk.Box):
         start, end = self.text_buffer.get_bounds()
         return self.text_buffer.get_text(start, end, False)
 
+    def set_text(self, text: str) -> None:
+        """Set the content of the input field.
+        
+        Args:
+            text: The text to set in the input field.
+        """
+        self.text_buffer.set_text(text, -1)
+
     def clear(self) -> None:
         """Clear the input field."""
         self.text_buffer.set_text("", -1)
@@ -142,7 +161,7 @@ class ChatInput(Gtk.Box):
         """
         self._api_client = api_client
 
-    def update_connection_status(self, connected: bool, message: str = "") -> None:
+    def set_model_status(self, connected: bool, message: str = "") -> None:
         """Update the connection status display.
         
         Args:
@@ -154,11 +173,13 @@ class ChatInput(Gtk.Box):
             color = "#00E676"  # Green
             self.status_dot.get_style_context().add_class("status-active")
             self.status_dot.get_style_context().remove_class("status-inactive")
+            self.refresh_button.hide()  # Hide refresh button when connected
         else:
             msg = message or "Disconnected · LM Studio"
             color = "#FF5252"  # Red
             self.status_dot.get_style_context().remove_class("status-active")
             self.status_dot.get_style_context().add_class("status-inactive")
+            self.refresh_button.show()  # Show refresh button when disconnected
         
         self.status_label.set_markup(f"<span size='10000' foreground='{color}'>{msg}</span>")
 
@@ -207,3 +228,12 @@ class ChatInput(Gtk.Box):
         if normalized not in ("ask", "plan", "agent"):
             normalized = "ask"
         self.mode_combo.set_active_id(normalized)
+
+    def connect_refresh(self, callback):
+        """Connect the refresh button click signal.
+        
+        Args:
+            callback: Function to call when refresh is clicked.
+        """
+        self._refresh_callback = callback
+        self.refresh_button.connect("clicked", lambda btn: callback())

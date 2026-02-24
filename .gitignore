@@ -159,3 +159,6 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 =0.7.0
+GEMINI.md
+PROJECT_CONSTITUTION.md
+PROJECT_INDEX.json

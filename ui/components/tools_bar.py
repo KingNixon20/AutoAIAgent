@@ -120,7 +120,8 @@ class ToolsBar(Gtk.Box):
             # Create scrolled container for tool list
             scroll_box = Gtk.ScrolledWindow()
             scroll_box.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-            scroll_box.set_max_content_height(520)
+            scroll_box.set_max_content_height(800)  # Increased to show more tools
+            scroll_box.set_propagate_natural_height(True)
             
             popover_container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
             popover_container.set_margin_top(8)

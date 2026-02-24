@@ -150,20 +150,22 @@ class LMStudioClient:
         this method executes each call via `tool_executor`, appends tool results,
         and continues until a final assistant message is returned.
         """
-        # Use fresh session - safe when called from different event loop (e.g. background thread)
-        session = aiohttp.ClientSession()
+        # Use the session managed by the LMStudioClient instance
+        if not self.session:
+            # This should ideally not happen if initialize() was awaited, but for safety
+            await self.initialize() # Ensure session is created
 
         # Check connection with this session
         try:
-            async with session.get(
+            async with self.session.get( # Use self.session
                 f"{self.endpoint}{C.API_MODELS}",
                 timeout=aiohttp.ClientTimeout(total=5),
             ) as resp:
                 if resp.status != 200:
-                    await session.close()
+                    # No need to close self.session here, it's managed by the client
                     raise ConnectionError(f"Cannot reach LM Studio at {self.endpoint}")
         except Exception as e:
-            await session.close()
+            # No need to close self.session here
             raise ConnectionError(f"Cannot reach LM Studio: {e}") from e
 
         # Full conversation context for AI memory - all prior messages + current
