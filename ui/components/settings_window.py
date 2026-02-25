@@ -9,6 +9,7 @@ gi.require_version("Gtk", "3.0")
 from gi.repository import Gtk, Gdk
 
 from models import ConversationSettings
+import storage
 from storage import (
     save_app_mcp_server,
     load_app_mcp_servers,
@@ -586,3 +587,7 @@ class SettingsWindow(Gtk.Box):
         self._model_settings_state["auto_tool_approval"] = value
         if hasattr(self, "auto_tool_approval_toggle"):
             self.auto_tool_approval_toggle.set_active(value)
+        
+        # Ensure the global settings are saved after this programmatic change
+        # to ensure persistence across sessions.
+        storage.save_settings(self.get_settings())

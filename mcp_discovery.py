@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 import re
+import os
 from typing import Optional
 
 import aiohttp
@@ -181,8 +182,14 @@ class MCPToolDiscovery:
     async def _discover_stdio(self, command: str, cfg: dict) -> list[dict]:
         """Discover tools from stdio MCP server (best-effort JSON-RPC over lines)."""
         args = cfg.get("args") if isinstance(cfg.get("args"), list) else []
-        env = cfg.get("env") if isinstance(cfg.get("env"), dict) else None
+        # Merge provided env with current environment so PATH and system vars remain available
+        cfg_env = cfg.get("env") if isinstance(cfg.get("env"), dict) else {}
+        env = {**os.environ, **cfg_env} if cfg_env else None
 
+        # Prefer an explicit cwd from config, otherwise use the repository root
+        default_repo_root = os.path.abspath(os.path.dirname(__file__))
+        cwd = cfg.get("cwd") if isinstance(cfg.get("cwd"), str) and cfg.get("cwd") else default_repo_root
+        logger.debug("Starting MCP stdio proc: %s %s (cwd=%s)", command, args, cwd)
         proc = await asyncio.create_subprocess_exec(
             command,
             *[str(a) for a in args],
@@ -190,26 +197,47 @@ class MCPToolDiscovery:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=env,
+            cwd=cwd,
         )
+
+        # Start background task to drain and log stderr to aid debugging
         try:
-            await self._stdio_jsonrpc(proc, 1, "initialize", {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": {"name": "AutoAIAgent", "version": "1.0"},
-            }, allow_fail=True)
+            asyncio.create_task(self._drain_proc_stderr(proc, f"discover:{command}"))
+        except Exception:
+            pass
+        try:
+            await self._stdio_jsonrpc(
+                proc,
+                1,
+                "initialize",
+                {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": {"name": "AutoAIAgent", "version": "1.0"},
+                },
+                allow_fail=True,
+            )
             resp = await self._stdio_jsonrpc(proc, 2, "tools/list", {}, allow_fail=False)
             return self._extract_tools_from_result(resp)
         finally:
-            if proc.returncode is None:
-                proc.terminate()
-                try:
-                    await asyncio.wait_for(proc.wait(), timeout=1.0)
-                except asyncio.TimeoutError:
-                    proc.kill()
+            # Ensure process is cleaned up and log exit status for diagnostics
+            try:
+                if proc.returncode is None:
+                    proc.terminate()
+                    try:
+                        await asyncio.wait_for(proc.wait(), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        proc.kill()
+                logger.debug("MCP stdio proc exit code (%s %s): %s", command, args, proc.returncode)
+            except Exception as e:
+                logger.debug("Error while terminating MCP proc (%s): %s", command, e)
 
     async def _call_tool_stdio(self, command: str, cfg: dict, tool_name: str, arguments: dict) -> dict:
         args = cfg.get("args") if isinstance(cfg.get("args"), list) else []
-        env = cfg.get("env") if isinstance(cfg.get("env"), dict) else None
+        # Merge provided env with current environment so subprocess can find binaries
+        cfg_env = cfg.get("env") if isinstance(cfg.get("env"), dict) else {}
+        env = {**os.environ, **cfg_env} if cfg_env else None
+        cwd = cfg.get("cwd") if isinstance(cfg.get("cwd"), str) and cfg.get("cwd") else os.getcwd()
         proc = await asyncio.create_subprocess_exec(
             command,
             *[str(a) for a in args],
@@ -217,7 +245,12 @@ class MCPToolDiscovery:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=env,
+            cwd=cwd,
         )
+        try:
+            asyncio.create_task(self._drain_proc_stderr(proc, f"call:{command}"))
+        except Exception:
+            pass
         try:
             await self._stdio_jsonrpc(
                 proc,
@@ -269,6 +302,23 @@ class MCPToolDiscovery:
                 logger.debug("MCP initialize failed for %s: %s", url, e)
                 return {}
             raise
+
+    async def _drain_proc_stderr(self, proc: asyncio.subprocess.Process, label: str) -> None:
+        """Read and log stderr lines from a subprocess for debugging."""
+        try:
+            if proc.stderr is None:
+                return
+            while True:
+                line = await proc.stderr.readline()
+                if not line:
+                    break
+                try:
+                    text = line.decode("utf-8", errors="replace").strip()
+                except Exception:
+                    text = str(line)
+                logger.debug("MCP proc stderr (%s): %s", label, text)
+        except Exception as e:
+            logger.debug("Error reading MCP proc stderr (%s): %s", label, e)
 
     async def _stdio_jsonrpc(
         self,

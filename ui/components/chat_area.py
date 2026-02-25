@@ -3,12 +3,14 @@ Chat message display area widget.
 """
 import os
 import gi
+from datetime import datetime
 
 from typing import Callable, Optional
 gi.require_version("Gtk", "3.0")
 from gi.repository import Gtk, GLib
 
-from models import Message, Conversation, ConversationSettings
+from models import Message, Conversation, ConversationSettings, MessageRole
+import constants as C
 from ui.components.message_bubble import MessageBubble, TypingIndicator
 
 
@@ -33,6 +35,8 @@ class ChatArea(Gtk.Box):
         self._autoscroll_enabled = True
         self._autoscroll_pulses = 0
         self._autoscroll_source_id = None
+        self._last_known_container_width = 0  # Track width changes
+        self._initial_layout_done = False  # Track if initial layout has been applied
         
         self.on_edit_message_request = on_edit_message_request
         self.on_repush_message_request = on_repush_message_request
@@ -92,18 +96,24 @@ class ChatArea(Gtk.Box):
         scrolled = Gtk.ScrolledWindow()
         scrolled.set_vexpand(True)
         scrolled.set_hexpand(True)
+        # Prevent horizontal scrolling - messages should wrap, not scroll horizontally
+        scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
 
         self.messages_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         self.messages_box.set_homogeneous(False)
         self.messages_box.set_hexpand(True)
-        # Keep minimum small enough so compact windows still fit sidebar + chat.
-        self.messages_box.set_size_request(280, -1)
+        self.messages_box.set_halign(Gtk.Align.FILL)
+        # Don't set a fixed size_request - let content expand to fill available space
+        # Messages will be constrained by their max-width to prevent excessive line lengths
+        self.messages_box.set_size_request(-1, -1)
 
         scrolled.add(self.messages_box)
         self.add(scrolled)
 
         self.scrolled = scrolled
         self.messages_box.connect("size-allocate", self._on_messages_size_allocate)
+        # Connect to ChatArea's own size-allocate to fix initial layout on app launch
+        self.connect("size-allocate", self._on_chat_area_size_allocate)
 
     def get_message_bubble_by_id(self, message_id: str) -> Optional[MessageBubble]:
         """Finds and returns a MessageBubble widget by its associated message ID."""
@@ -206,6 +216,9 @@ class ChatArea(Gtk.Box):
         self._typing_shown = False
         if hasattr(self, "_typing_indicator_widget"):
             del self._typing_indicator_widget
+        
+        # Reset initial layout flag so new conversation gets proper width
+        self._initial_layout_done = False
 
         # Store conversation and context limit
         self._current_conversation = conversation
@@ -223,18 +236,20 @@ class ChatArea(Gtk.Box):
 
         # Add messages
         self._last_date = None
-        # Pre-calculate available width once for existing messages
-        total_horizontal_margins = 20 + 20 # MessageBubble's own margins
-        current_available_width = self.messages_box.get_allocated_width() - total_horizontal_margins
-        if current_available_width < 100:
-            current_available_width = 100
+        # Messages will automatically calculate their width based on available space
+        # When added, each message will use the current container width or a fallback
+        # As the layout resizes, all messages will adapt via _update_message_widths_for_container
 
         for message in conversation.messages:
-            # Pass the calculated width to add_message
-            self.add_message(message, animate=False, max_content_width=current_available_width)
+            # Don't pass width - let add_message calculate it dynamically
+            self.add_message(message, animate=False)
 
         # Auto scroll to bottom
         self._request_scroll_to_bottom(8)
+        
+        # Schedule width fixup after initial layout - this ensures messages get correct width
+        # on app launch before they're rendered
+        GLib.idle_add(self._schedule_width_fixup)
 
     def set_context_limit(self, context_limit: int) -> None:
         """Update context limit for subtitle rendering."""
@@ -258,10 +273,22 @@ class ChatArea(Gtk.Box):
         calculated_width = max_content_width
         if calculated_width == -1: # If not passed, calculate it
             # Account for MessageBubble's set_margin_start(20) and set_margin_end(20)
+            allocated_width = self.messages_box.get_allocated_width()
             total_horizontal_margins = 20 + 20
-            calculated_width = self.messages_box.get_allocated_width() - total_horizontal_margins
-            if calculated_width < 100: # Ensure a minimum width
-                calculated_width = 100
+            
+            # Use actual allocated space if available, otherwise a conservative fallback
+            if allocated_width > 1:
+                calculated_width = allocated_width - total_horizontal_margins
+            else:
+                # Fallback: use 550px (conservative) - will be corrected by _schedule_width_fixup
+                calculated_width = 550
+            
+            # Cap to CHAT_MAX_WIDTH to prevent excessively long lines
+            calculated_width = min(calculated_width, C.CHAT_MAX_WIDTH)
+            
+            # Ensure minimum reasonable width
+            if calculated_width < 400:
+                calculated_width = 400
 
         # Create and add message bubble
         bubble = MessageBubble(
@@ -273,7 +300,10 @@ class ChatArea(Gtk.Box):
             max_content_width=calculated_width,
         )
         self.messages_box.add(bubble)
-        bubble.show_all()  # Make sure message bubble is visible
+        bubble.show()  # Show bubble itself, not all children recursively
+        # If it's a user message, ensure edit container stays hidden
+        if message.role == MessageRole.USER and hasattr(bubble, 'message_edit_container'):
+            bubble.message_edit_container.hide()
 
         # Update context display
         self._update_subtitle()
@@ -565,10 +595,59 @@ class ChatArea(Gtk.Box):
         adj.set_value(adj.get_upper() - adj.get_page_size())
         return False
 
-    def _on_messages_size_allocate(self, *_args) -> None:
-        """Keep viewport pinned to newest message as content grows."""
+    def _on_messages_size_allocate(self, widget, allocation) -> None:
+        """Update message widths when container is resized and keep viewport pinned."""
+        # Recalculate message widths if container width changed
+        # This makes the chat adapt when sidebar/tools panels are resized
+        current_width = allocation.width if allocation else 0
+        if current_width > 1 and current_width != self._last_known_container_width:
+            self._last_known_container_width = current_width
+            self._update_message_widths_for_container(current_width)
+        
+        # Keep viewport pinned to newest message as content grows
         if self._autoscroll_enabled:
             self._request_scroll_to_bottom(3)
+    
+    def _on_chat_area_size_allocate(self, widget, allocation) -> None:
+        """Handle ChatArea's initial layout - fixes width on app launch.
+        
+        On application launch, the widget doesn't have a real width until after
+        the initial size-allocate. This ensures messages get correct widths.
+        """
+        if not self._initial_layout_done and allocation.width > 1:
+            self._initial_layout_done = True
+            # Now that we have a real width, update all messages
+            self._update_message_widths_for_container(allocation.width)
+    
+    def _schedule_width_fixup(self) -> bool:
+        """Deferred callback to fix message widths after initial layout.
+        
+        This is called via idle_add to ensure GTK has completed the initial layout
+        before we try to update message widths.
+        """
+        # Get the actual allocated width from messages_box
+        allocated_width = self.messages_box.get_allocated_width()
+        if allocated_width > 1:
+            self._update_message_widths_for_container(allocated_width)
+        else:
+            # If still not allocated, try again next iteration
+            return True
+        return False
+    
+    def _update_message_widths_for_container(self, container_width: int) -> None:
+        """Update all message bubble widths to fit the current container width."""
+        if container_width <= 1:
+            return
+        
+        total_horizontal_margins = 20 + 20  # MessageBubble's own margins
+        new_width = container_width - total_horizontal_margins
+        new_width = min(new_width, C.CHAT_MAX_WIDTH)  # Cap to sensible max
+        new_width = max(new_width, 400)  # Ensure minimum
+        
+        # Update all message bubbles with the new width
+        for child in self.messages_box.get_children():
+            if isinstance(child, MessageBubble):
+                child.update_max_content_width(new_width)
 
     def _request_scroll_to_bottom(self, pulses: int = 6) -> None:
         """Schedule repeated bottom-scroll ticks to handle delayed layout updates."""

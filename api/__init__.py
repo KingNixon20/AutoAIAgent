@@ -222,6 +222,7 @@ class LMStudioClient:
             for round_idx in range(max_tool_rounds):
                 response = await self._chat_completion_once(
                     session=self.session, # Use self.session
+                    conversation=conversation,
                     model=conversation.model,
                     messages=messages,
                     settings_payload=settings_payload,
@@ -621,6 +622,7 @@ class LMStudioClient:
         model: str,
         messages: list[dict],
         settings_payload: dict,
+        conversation: Optional[Conversation] = None,
     ) -> dict:
         """Issue one non-stream completion request and return parsed JSON."""
         payload = {
@@ -629,6 +631,9 @@ class LMStudioClient:
             "stream": False,
             **settings_payload,
         }
+        if conversation:
+            payload["session_id"] = conversation.id
+        
         settings_snapshot = {
             "temperature": payload.get("temperature"),
             "top_p": payload.get("top_p"),

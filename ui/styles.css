@@ -62,7 +62,6 @@ button {
   color: @text-secondary;
   border: 1px solid @border-color;
   border-radius: 6px;
-  transition: all 200ms;
   font-weight: 500;
 }
 
@@ -255,7 +254,7 @@ separator {
 }
 
 .messages-container {
-  background-color: @bg-primary;
+  background-color: #292929;
   padding: 10px 14px;
 }
 
@@ -294,7 +293,6 @@ separator {
   border-left: 3px solid transparent;
   margin: 2px 8px;
   border-radius: 4px;
-  transition: all 150ms;
 }
 
 .conversation-item:hover {

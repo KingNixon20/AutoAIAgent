@@ -161,6 +161,16 @@ class ChatInput(Gtk.Box):
         """
         self._api_client = api_client
 
+    def update_connection_status(self, connected: bool, message: str = "") -> None:
+        """Backward-compatible alias used by main window to update connection state.
+
+        Args:
+            connected: Whether the API is connected.
+            message: Optional status message to display.
+        """
+        # Forward to the existing `set_model_status` implementation.
+        self.set_model_status(connected, message)
+
     def set_model_status(self, connected: bool, message: str = "") -> None:
         """Update the connection status display.
         

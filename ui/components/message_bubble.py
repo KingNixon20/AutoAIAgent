@@ -98,9 +98,10 @@ class MessageBubble(Gtk.Box):
             # Response section - expand vertically, no scrolling
             text_widget = build_formatted_text_view(
                 response if response else message.content,
-                max_width=self.max_content_width if self.max_content_width > 0 else min(800, C.CHAT_MAX_WIDTH),
+                max_width=self.max_content_width if self.max_content_width > 0 else 700,
             )
             content_box.pack_start(text_widget, True, True, 0)
+            self.message_display_widget = text_widget  # Store for dynamic width updates
             tool_events = self._extract_tool_events(message)
             if tool_events:
                 tools_box = self._build_tools_section(tool_events)
@@ -165,9 +166,10 @@ class MessageBubble(Gtk.Box):
         
         # Footer metadata (message context + timestamp)
         footer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        footer.set_halign(Gtk.Align.END)
+        footer.set_halign(Gtk.Align.FILL)
+        footer.set_hexpand(True)
 
-        # Action buttons (re-push, edit, delete)
+        # Action buttons (re-push, edit, delete) - pack at END for right alignment
         action_buttons_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         action_buttons_box.set_halign(Gtk.Align.END)
         action_buttons_box.set_valign(Gtk.Align.CENTER)
@@ -209,21 +211,8 @@ class MessageBubble(Gtk.Box):
         action_buttons_box.pack_start(delete_btn, False, False, 0)
         self.delete_button = delete_btn
 
-        footer.pack_start(action_buttons_box, False, False, 0)
-
-
-
-        token_count = self._message_token_count(message)
-        token_label = Gtk.Label()
-        token_label.set_markup(
-            f"<span size='8200' foreground='#9a9a9a'>{token_count:,} token(s)</span>"
-        )
-        footer.pack_start(token_label, False, False, 0)
-
-        timestamp_str = message.timestamp.strftime("%H:%M")
-        timestamp = Gtk.Label()
-        timestamp.set_markup(f"<span size='8200' foreground='#808080'>{timestamp_str}</span>")
-        footer.pack_start(timestamp, False, False, 0)
+        # Pack action buttons at END (right side) of footer
+        footer.pack_end(action_buttons_box, False, False, 0)
         
         # The MessageBubble (self) should pack its children directly.
         # 'header' is already packed with 'self.pack_start(header, False, False, 0)' at the beginning of __init__
@@ -237,6 +226,10 @@ class MessageBubble(Gtk.Box):
         
         # Show all children
         self.show_all()
+        
+        # Ensure edit container is hidden initially (show_all() overrides the earlier hide())
+        if hasattr(self, 'message_edit_container'):
+            self.message_edit_container.hide()
 
     def set_edit_mode(self, editing: bool) -> None:
         """Set the message bubble into or out of edit mode."""
@@ -262,6 +255,26 @@ class MessageBubble(Gtk.Box):
             if self.repush_button:
                 self.repush_button.show()
             self.delete_button.show()
+
+    def update_max_content_width(self, new_width: int) -> None:
+        """Update the maximum width constraint for message content.
+        
+        Called when the container is resized to make messages adapt to available space.
+        """
+        if new_width <= 0:
+            return
+        
+        self.max_content_width = new_width
+        
+        # Update the display widget if it exists (both user labels and assistant text views)
+        if hasattr(self, 'message_display_widget') and self.message_display_widget:
+            if isinstance(self.message_display_widget, Gtk.Label):
+                # Update user message label width
+                self.message_display_widget.set_max_width_chars(int(new_width / 5))
+            elif hasattr(self.message_display_widget, '_max_width'):
+                # Update ClampedTextView (assistant messages)
+                self.message_display_widget._max_width = new_width
+                self.message_display_widget.queue_resize()
 
     def _on_edit_submitted(self, _button) -> None:
         """Handle save button click in edit mode."""

@@ -98,7 +98,8 @@ class AutoAIApplication(Gtk.Application):
             app: The Gtk.Application instance.
         """
         if self.window is None:
-            self.window = MainWindow(self)
+            global asyncio_thread
+            self.window = MainWindow(self, asyncio_thread)
         
         self.window.present()
         
@@ -114,6 +115,7 @@ class AutoAIApplication(Gtk.Application):
         else:
             logger.error("Asyncio loop not running in separate thread.")
         return False  # Don't reschedule
+    
 
 
 def main():

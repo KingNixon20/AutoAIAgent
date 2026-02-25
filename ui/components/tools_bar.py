@@ -57,6 +57,8 @@ class ToolsBar(Gtk.Box):
         self._mcp_discovery = mcp_discovery
         self._server_configs = server_configs or {}
         self._discovered_tools_cache: dict[str, list[dict]] = {}
+        # Map of integration_id -> popover container widget created during init
+        self._popover_containers: dict[str, Gtk.Box] = {}
         self._loading_popovers: set[str] = set()
 
         if not self._tools:
@@ -132,6 +134,8 @@ class ToolsBar(Gtk.Box):
             # Store the container so we can update it when tools are discovered
             popover_container._integration_id = integration_id
             popover_container._popover = popover
+            # Keep a reference to the container so callers can refresh it
+            self._popover_containers[integration_id] = popover_container
             
             # Initially show config-declared calls or placeholder
             self._populate_tool_popover(popover_container, integration_id)
@@ -153,6 +157,19 @@ class ToolsBar(Gtk.Box):
             vbox.pack_start(row, False, False, 0)
 
         self.pack_start(scroller, True, True, 0)
+
+        # Add a separator
+        vbox.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL, margin_top=10, margin_bottom=5), False, False, 0)
+
+        # Add the critique checkbox
+        self.critique_checkbox = Gtk.CheckButton(label="Enable Self-Critique")
+        self.critique_checkbox.set_active(True) # Enabled by default
+        self.critique_checkbox.set_tooltip_text("Enable this to have the Agent critique its own work and suggest improvements.")
+        vbox.pack_start(self.critique_checkbox, False, False, 0)
+
+    def get_critique_enabled(self) -> bool:
+        """Return whether the critique checkbox is enabled."""
+        return self.critique_checkbox.get_active()
 
     def _populate_tool_popover(self, container: Gtk.Box, integration_id: str) -> None:
         """Populate a popover container with tool definitions."""
@@ -329,6 +346,14 @@ class ToolsBar(Gtk.Box):
         """Set or update MCP discovery capability after initialization."""
         self._mcp_discovery = mcp_discovery
         self._server_configs = server_configs or {}
+
+    def refresh_all_popovers(self) -> None:
+        """Refresh all popover containers from the discovered tools cache."""
+        for integration_id, container in getattr(self, "_popover_containers", {}).items():
+            try:
+                self._populate_tool_popover(container, integration_id)
+            except Exception:
+                logger.debug("Failed to refresh popover for %s", integration_id)
 
     def get_enabled_tools(self) -> list[str]:
         """Return integration ids of currently enabled tools (switch on)."""

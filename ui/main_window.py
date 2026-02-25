@@ -10,6 +10,7 @@ from ui.components import (
     ToolsBar,
 )
 from mcp_discovery import MCPToolDiscovery
+import storage
 from storage import (
     load_conversations,
     load_tools,
@@ -19,6 +20,8 @@ from storage import (
     save_conversations,
     write_file,
     append_file,
+    load_settings,
+    save_settings,
 )
 from api import LMStudioClient
 from models import Message, MessageRole, Conversation, ConversationSettings
@@ -34,6 +37,7 @@ import os
 import json
 import shlex
 import difflib # Added for diff generation
+from datetime import datetime
 from token_counter import count_text_tokens
 from project_map import refresh_project_map
 import gi
@@ -141,8 +145,24 @@ class MainWindow(Gtk.ApplicationWindow):
         # Data
         self.conversations = {}
         self.current_conversation: Optional[Conversation] = None
-        self.settings = ConversationSettings()
+        self.settings = storage.load_settings()
         self.workspace_root = os.path.abspath(os.getcwd())
+        # Determine application code root (two levels up from this file)
+        self._app_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        # If the app was launched from inside the app repo, avoid using the
+        # app repo as the workspace root for safety — default to the user's
+        # home directory instead.
+        try:
+            in_app = (self.workspace_root == self._app_root) or self.workspace_root.startswith(self._app_root + os.sep)
+        except Exception:
+            in_app = False
+        if in_app:
+            fallback = os.path.expanduser("~") or self.workspace_root
+            logger.warning("Startup CWD %s is inside app repo; using fallback workspace %s", self.workspace_root, fallback)
+            self.workspace_root = os.path.abspath(fallback)
+            self._workspace_root_was_app = True
+        else:
+            self._workspace_root_was_app = False
         self.loaded_model_id: Optional[str] = None
         self._suppress_mode_change = False
         self._agent_running_conversations: set[str] = set()
@@ -165,7 +185,9 @@ class MainWindow(Gtk.ApplicationWindow):
         center_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         self.center_box = center_box
         center_box.set_homogeneous(False)
-        center_box.set_size_request(-1, -1)
+        # Set minimum width so content doesn't get pushed under the left panel
+        # 450px provides enough room for readable chat messages
+        center_box.set_size_request(450, -1)
 
         self.chat_area = ChatArea(
             on_edit_message_request=self._on_edit_message,
@@ -173,6 +195,8 @@ class MainWindow(Gtk.ApplicationWindow):
             on_delete_message_request=self._on_delete_message,
             on_message_edited_request=self._on_message_edited,
         )
+        # Ensure chat area has minimum width for readability
+        self.chat_area.set_size_request(450, -1)
         self.chat_area.on_chat_settings_changed = self._on_chat_settings_changed
         center_box.pack_start(self.chat_area, True, True, 0)
 
@@ -182,6 +206,9 @@ class MainWindow(Gtk.ApplicationWindow):
         self.chat_input.connect_send(self._on_send_message)
         self.chat_input.connect_mode_changed(self._on_chat_mode_changed)
         self.chat_input.connect_refresh(self._on_refresh_connection)
+        # Compatibility: ensure chat_input has `update_connection_status` alias
+        if not hasattr(self.chat_input, "update_connection_status") and hasattr(self.chat_input, "set_model_status"):
+            setattr(self.chat_input, "update_connection_status", self.chat_input.set_model_status)
         center_box.pack_end(self.chat_input, False, False, 0)
 
         # Right tools panel (resizable)
@@ -220,14 +247,40 @@ class MainWindow(Gtk.ApplicationWindow):
             mcp_discovery=self.mcp_discovery,
             server_configs=load_mcp_server_configs(),
         )
+        # Diagnostic: log available integration IDs and current enabled set
+        try:
+            GLib.idle_add(lambda: logger.debug(
+                "ToolsBar integrations: %s | enabled: %s",
+                list(getattr(self.tools_bar, "_tools_by_id", {}).keys()),
+                self.tools_bar.get_enabled_tools()
+            ) or False)
+        except Exception:
+            pass
+        # Enable default integrations only in Agent mode; they remain disabled in Ask/Plan modes.
+        try:
+            self._apply_default_tool_enables(self.chat_input.get_mode())
+        except Exception:
+            pass
+        # Also log enabled tools after default enables applied
+        try:
+            GLib.idle_add(lambda: logger.debug(
+                "Post-default-enable: integrations: %s | enabled: %s",
+                list(getattr(self.tools_bar, "_tools_by_id", {}).keys()),
+                self.tools_bar.get_enabled_tools()
+            ) or False)
+        except Exception:
+            pass
         self.tools_panel.pack_start(self.tools_bar, True, True, 0)
 
         chat_tools_paned = Gtk.HPaned()
         self.chat_tools_paned = chat_tools_paned
         chat_tools_paned.add1(center_box)
         chat_tools_paned.add2(self.tools_panel)
-        # Seed position before first allocation; exact size is applied in idle.
-        chat_tools_paned.set_position(max(260, int(default_width * 0.7)))
+        # Tools panel takes up DEFAULT_TOOLS_PANEL_RATIO of the total width
+        # Chat area gets the rest within the chat_tools_paned splitter
+        tools_panel_width = max(220, int(default_width * C.DEFAULT_TOOLS_PANEL_RATIO))
+        chat_tools_position = max(260, default_width - tools_panel_width)
+        chat_tools_paned.set_position(chat_tools_position)
 
         # Use a paned splitter so the user can resize sidebar <-> chat area
         paned = Gtk.HPaned()
@@ -243,13 +296,12 @@ class MainWindow(Gtk.ApplicationWindow):
             desired = min(desired, max(220, int(default_width * 0.3)))
             self._initial_pane_position = desired
             paned.set_position(desired)
-            # Right tools panel defaults to roughly sidebar width (+divider
-            # allowance).
-            self._initial_tools_panel_width = max(220, min(360, desired + 8))
+            # Tools panel uses DEFAULT_TOOLS_PANEL_RATIO, proportional to window width
+            self._initial_tools_panel_width = max(220, int(default_width * C.DEFAULT_TOOLS_PANEL_RATIO))
         except Exception:
             self._initial_pane_position = 240
             paned.set_position(260)
-            self._initial_tools_panel_width = 248
+            self._initial_tools_panel_width = 280
 
         # Settings window - opens as full overlay tab with all controls visible
         self.settings_window = SettingsWindow()
@@ -273,27 +325,74 @@ class MainWindow(Gtk.ApplicationWindow):
 
         self.add(self.settings_overlay)
         self.show_all()
-        GLib.idle_add(self._apply_initial_pane_position)
+        # Queue both layout setup and conversation loading to run after initial layout
+        # This ensures paned positions are set before conversations are loaded
+        GLib.idle_add(self._on_initial_layout_complete)
         # Hide settings window at startup
         self.settings_window.hide()
 
-        # Initialize conversations - load saved or create sample
-        self._load_or_create_conversations()
-
         # Setup keyboard shortcuts
         self._setup_shortcuts()
+        self.connect("destroy", self._on_destroy) # Connect destroy signal
 
 
 
-    def _on_configure_event(self, widget, event):
-        """Handle window configure events (e.g. size changes)."""
-        print("Configure event triggered")
+    def _on_configure_event(self, _widget, event) -> bool:
+        """Clamp runtime resize requests to safe max bounds.
+
+        We only enforce upper bounds here. Lower bounds are already handled by
+        geometry hints, and forcing min-size from transient configure events can
+        cause unwanted window snaps while interacting with popovers.
+        """
+        width = int(getattr(event, "width", 0) or 0)
+        height = int(getattr(event, "height", 0) or 0)
+        clamped_w = min(width, self._window_max_width)
+        clamped_h = min(height, self._window_max_height)
+        if (width > self._window_max_width) or (height > self._window_max_height):
+            GLib.idle_add(lambda: self.resize(clamped_w, clamped_h) or False)
+        return False
 
     async def _async_init(self) -> None:
         """Perform asynchronous initialization tasks."""
         await self.api_client.initialize()
         # Potentially add other async setup tasks here
         await self._check_api_connection_and_update_status()
+        # Run MCP discovery on startup to prime tool definitions for the UI
+        try:
+            server_configs = load_mcp_server_configs()
+            if isinstance(server_configs, dict) and server_configs:
+                enabled_ids = list(server_configs.keys())
+                logger.info("Running startup MCP discovery for: %s", ", ".join(enabled_ids))
+                discovered = await self.mcp_discovery.discover_tools(
+                    server_configs=server_configs,
+                    enabled_integrations=enabled_ids,
+                )
+                # Group discovered tools by integration id
+                by_iid: dict[str, list[dict]] = {}
+                for t in discovered:
+                    if not isinstance(t, dict):
+                        continue
+                    iid = t.get("integration_id")
+                    if not iid:
+                        continue
+                    by_iid.setdefault(iid, []).append(t)
+
+                # Cache results in the tools bar and refresh popovers if present
+                for iid, tools in by_iid.items():
+                    try:
+                        self.tools_bar._discovered_tools_cache[iid] = tools
+                        container = getattr(self.tools_bar, "_popover_containers", {}).get(iid)
+                        if container:
+                            GLib.idle_add(lambda c=container, iid=iid: self.tools_bar._populate_tool_popover(c, iid) or c.show_all() or False)
+                    except Exception:
+                        logger.debug("Failed to populate discovered tools for %s", iid)
+                # Ensure all popovers are refreshed on the main loop
+                try:
+                    GLib.idle_add(self.tools_bar.refresh_all_popovers)
+                except Exception:
+                    logger.debug("Failed to schedule refresh_all_popovers")
+        except Exception as e:
+            logger.debug("Startup MCP discovery failed: %s", e)
 
     async def _check_api_connection_and_update_status(self) -> None:
         """Check API connection and update UI."""
@@ -326,6 +425,17 @@ class MainWindow(Gtk.ApplicationWindow):
                 "Disconnected",
                 priority=GLib.PRIORITY_DEFAULT,
             )
+
+    def _on_initial_layout_complete(self) -> bool:
+        """Callback for initial layout completion.
+        
+        Applies pane positions first, then loads conversations.
+        This ensures the chat area width is correctly determined before messages are created.
+        """
+        self._apply_initial_pane_position()
+        # Now that layout is ready, load conversations
+        self._load_or_create_conversations()
+        return False
 
     def _apply_initial_pane_position(self) -> bool:
         """Apply sidebar split after initial allocation for reliable startup layout."""
@@ -368,7 +478,8 @@ class MainWindow(Gtk.ApplicationWindow):
 
     def _load_project_constitution(self) -> str:
         """Load the project constitution file."""
-        constitution_path = os.path.join(self.workspace_root, "PROJECT_CONSTITUTION.md")
+        root = self._get_workspace_root()
+        constitution_path = os.path.join(root, "PROJECT_CONSTITUTION.md")
         if not os.path.exists(constitution_path):
             logger.warning("PROJECT_CONSTITUTION.md not found at %s", constitution_path)
             return ""
@@ -381,7 +492,8 @@ class MainWindow(Gtk.ApplicationWindow):
 
     def _load_project_index(self) -> dict:
         """Load the project index file."""
-        index_path = os.path.join(self.workspace_root, "PROJECT_INDEX.json")
+        root = self._get_workspace_root()
+        index_path = os.path.join(root, "PROJECT_INDEX.json")
         if not os.path.exists(index_path):
             logger.info("PROJECT_INDEX.json not found at %s. Returning empty index.", index_path)
             return {}
@@ -397,7 +509,8 @@ class MainWindow(Gtk.ApplicationWindow):
 
     def _save_project_index(self, index_data: dict) -> None:
         """Save the project index file."""
-        index_path = os.path.join(self.workspace_root, "PROJECT_INDEX.json")
+        root = self._get_workspace_root()
+        index_path = os.path.join(root, "PROJECT_INDEX.json")
         try:
             with open(index_path, "w", encoding="utf-8") as f:
                 json.dump(index_data, f, indent=2, ensure_ascii=False)
@@ -407,7 +520,8 @@ class MainWindow(Gtk.ApplicationWindow):
 
     def _load_decision_log(self) -> str:
         """Load the decision log file."""
-        log_path = os.path.join(self.workspace_root, "DECISION_LOG.md")
+        root = self._get_workspace_root()
+        log_path = os.path.join(root, "DECISION_LOG.md")
         if not os.path.exists(log_path):
             logger.warning("DECISION_LOG.md not found at %s", log_path)
             return ""
@@ -417,20 +531,6 @@ class MainWindow(Gtk.ApplicationWindow):
         except Exception as e:
             logger.error("Error reading DECISION_LOG.md: %s", e)
             return ""
-        """Clamp runtime resize requests to safe max bounds.
-
-        We only enforce upper bounds here. Lower bounds are already handled by
-        geometry hints, and forcing min-size from transient configure events can
-        cause unwanted window snaps while interacting with popovers.
-        """
-        width = int(getattr(event, "width", 0) or 0)
-        height = int(getattr(event, "height", 0) or 0)
-        clamped_w = min(width, self._window_max_width)
-        clamped_h = min(height, self._window_max_height)
-        if (width > self._window_max_width) or (
-                height > self._window_max_height):
-            GLib.idle_add(lambda: self.resize(clamped_w, clamped_h) or False)
-        return False
 
     def _load_or_create_conversations(self) -> None:
         """Load saved conversations from disk, or create a sample if none exist."""
@@ -524,6 +624,11 @@ class MainWindow(Gtk.ApplicationWindow):
                 "Mode switched away from Agent.")
         self.current_conversation.chat_mode = mode
         self._save_conversations()
+        # Adjust default enabled integrations according to mode
+        try:
+            self._apply_default_tool_enables(mode)
+        except Exception:
+            pass
 
     def _on_sidebar_tasks_changed(
             self, conversation_id: str, tasks: list[dict]) -> None:
@@ -711,13 +816,17 @@ class MainWindow(Gtk.ApplicationWindow):
                 self._regenerate_response_from_message(last_msg.id)
 
     def _on_message_edited(self, message_id: str, new_content: str) -> None:
-        """Handles a message being edited in the UI."""
+        """Handles a message being edited in the UI.
+        
+        The chat_area has already updated the message content in the conversation
+        and removed subsequent messages. We just save the conversation state.
+        The user can then click repush/re-iterate if they want to regenerate the response.
+        """
         logger.debug("Message %s edited to: %s", message_id, new_content)
         if self.current_conversation:
-            # The chat_area already updated the message content in the conversation
-            # and removed subsequent messages.
-            # Now, trigger AI response from this message onwards.
-            self._regenerate_response_from_message(message_id)
+            # Save the edited conversation state
+            self._save_conversations()
+            logger.debug("Conversation saved after message edit.")
 
     def _regenerate_response_from_message(self, message_id: str) -> None:
         """Regenerates AI response starting from the message with message_id."""
@@ -884,8 +993,8 @@ class MainWindow(Gtk.ApplicationWindow):
             self._set_agent_running(conversation_id, True)
             self._clear_agent_stop_request(conversation_id)
             try:
-                global asyncio_thread # Access the global asyncio thread
-                if asyncio_thread.loop and asyncio_thread.loop.is_running():
+                # Use the asyncio thread instance passed to MainWindow
+                if getattr(self, "asyncio_thread", None) and getattr(self.asyncio_thread, "loop", None) and self.asyncio_thread.loop.is_running():
                     logger.debug("_fetch_ai_response: Submitting agent mode sequence to asyncio_thread.")
                     future = asyncio.run_coroutine_threadsafe(
                         self._run_agent_mode_sequence(
@@ -894,7 +1003,7 @@ class MainWindow(Gtk.ApplicationWindow):
                             settings=settings,
                             user_text=user_text,
                         ),
-                        asyncio_thread.loop
+                        self.asyncio_thread.loop
                     )
                     future.result() # Blocks until completion
                     logger.debug("_fetch_ai_response: Agent mode sequence completed in asyncio_thread.")
@@ -957,29 +1066,17 @@ class MainWindow(Gtk.ApplicationWindow):
                 logger.error("Asyncio loop not running in separate thread during _fetch_ai_response.")
                 raise ConnectionError("Asyncio event loop is not running. Cannot reach LM Studio.")
         except Exception as e:
-            logger.warning("API request failed (%s), using fallback: %s", type(e).__name__, e)
-            GLib.idle_add(
-                self._add_assistant_message_and_save,
-                f"API request failed: {type(e).__name__} - {e}. Using fallback response.",
-                conversation_id,
-                [],
-                None,
-                priority=GLib.PRIORITY_DEFAULT,
-            )
+            error_message = f"Failed to get AI response: {type(e).__name__} - {e}"
+            logger.error(error_message) # Change to error since we're not falling back
+            response_text = error_message # Use the error message directly
             planned_tasks = []
             followup_message = ""
             followup_tasks = []
 
         if response_text is None:
-            logger.debug("_fetch_ai_response: response_text is None, generating random fallback.")
-            import random
-            responses = [
-                "That's a great question! Let me think about that...",
-                "I understand. Here's what I think about that topic.",
-                "Interesting point. In my experience, the key considerations are:",
-                "I can help with that. Let me break it down for you.",
-            ]
-            response_text = random.choice(responses)
+            # If for some reason response_text is still None (e.g., empty API response with no error),
+            # provide a generic message. This should be rare with the above change.
+            response_text = "AI did not provide a response."
 
         logger.info("Assistant: %s", response_text)
 
@@ -1043,8 +1140,8 @@ class MainWindow(Gtk.ApplicationWindow):
         tool_choice = None
 
         # Discover full MCP tool definitions (name/description/input schema)
-        # from enabled endpoints.
-        if enabled_mcp_external:
+        # from enabled endpoints. Do NOT discover or use tools in `plan` mode.
+        if enabled_mcp_external and mode != "plan":
             server_configs = load_mcp_server_configs()
             discovered_tools = await self.mcp_discovery.discover_tools(
                 server_configs=server_configs,
@@ -1074,7 +1171,8 @@ class MainWindow(Gtk.ApplicationWindow):
             server_configs = {}
 
         # Optionally merge configured tools tied to enabled integrations.
-        if configured_tools is not None and enabled_mcp_external:
+        # Skip merging when in `plan` mode to prevent tool usage.
+        if configured_tools is not None and enabled_mcp_external and mode != "plan":
             selected_tools.extend(
                 self._select_tools_for_enabled_integrations(
                     configured_tools, enabled_mcp_external)
@@ -1087,8 +1185,8 @@ class MainWindow(Gtk.ApplicationWindow):
         selected_tools = self._dedupe_tool_definitions(selected_tools)
 
         # Fallback: if we have enabled integrations but no discovered tools, create minimal placeholders
-        # so the API receives tool definitions to work with
-        if enabled_mcp_external and not selected_tools and not builtin_enabled:
+        # so the API receives tool definitions to work with. Do NOT create placeholders in `plan` mode.
+        if mode != "plan" and enabled_mcp_external and not selected_tools and not builtin_enabled:
             logger.warning(
                 "No tools discovered for enabled integrations %s; creating placeholder tools",
                 enabled_mcp_external,
@@ -1143,24 +1241,79 @@ class MainWindow(Gtk.ApplicationWindow):
         mcp_tool_map = self._build_mcp_tool_map(selected_tools)
         tool_events: list[dict] = []
         ev_collector = lambda ev: tool_events.append(ev) # Define the event collector
-        response_text = await self.api_client.chat_completion_with_tools(
-            conversation=conversation,
-            settings=current_settings,
-            tool_executor=lambda name, args: self._execute_tool_call_with_approval(
-                name,
-                args,
-                settings=current_settings,
-                mcp_tool_map=mcp_tool_map,
-                server_configs=server_configs,
-                on_tool_event=ev_collector, # Pass the collector function
-            ),
-            on_tool_event=lambda ev: tool_events.append(ev),
-        )
+        # Call the LM Studio API with retries on transient connection failures.
+        max_attempts = 3
+        last_exc = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                response_text = await self.api_client.chat_completion_with_tools(
+                    conversation=conversation,
+                    settings=current_settings,
+                    tool_executor=lambda name, args: self._execute_tool_call_with_approval(
+                        name,
+                        args,
+                        settings=current_settings,
+                        mcp_tool_map=mcp_tool_map,
+                        server_configs=server_configs,
+                        on_tool_event=ev_collector, # Pass the collector function
+                    ),
+                    on_tool_event=lambda ev: tool_events.append(ev),
+                )
+                # Success: break out of retry loop
+                last_exc = None
+                break
+            except Exception as e:
+                last_exc = e
+                logger.warning("API call attempt %d/%d failed: %s", attempt, max_attempts, e)
+                # Try to reinitialize the client session before next attempt
+                try:
+                    await self.api_client.initialize()
+                    logger.debug("Reinitialized LM Studio client session after failure.")
+                except Exception as ie:
+                    logger.debug("Failed to reinitialize LM Studio client: %s", ie)
+                if attempt < max_attempts:
+                    await asyncio.sleep(3)
+                else:
+                    # All attempts failed: update UI to disconnected and return error
+                    logger.error("All API attempts failed: %s", last_exc)
+                    GLib.idle_add(self.chat_input.set_model_status, False, "Disconnected", priority=GLib.PRIORITY_DEFAULT)
+                    raise
         planned_tasks = []
         if mode == "plan" and response_text:
             planned_tasks = self._extract_tasks_from_plan_response(
                 response_text)
         return (response_text, tool_events, planned_tasks)
+
+    async def _chat_with_retries(self, conversation: Conversation, settings: ConversationSettings, tool_executor=None) -> str:
+        """Call `api_client.chat_completion_with_tools` with retry on transient failures.
+
+        Reinitializes the API client between attempts and updates UI to Disconnected
+        on final failure.
+        """
+        max_attempts = 3
+        last_exc = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                result = await self.api_client.chat_completion_with_tools(
+                    conversation=conversation,
+                    settings=settings,
+                    tool_executor=tool_executor,
+                )
+                return result
+            except Exception as e:
+                last_exc = e
+                logger.warning("API call attempt %d/%d failed: %s", attempt, max_attempts, e)
+                try:
+                    await self.api_client.initialize()
+                    logger.debug("Reinitialized LM Studio client after failure.")
+                except Exception as ie:
+                    logger.debug("Failed to reinitialize LM Studio client: %s", ie)
+                if attempt < max_attempts:
+                    await asyncio.sleep(3)
+                else:
+                    logger.error("All API attempts failed: %s", last_exc)
+                    GLib.idle_add(self.chat_input.set_model_status, False, "Disconnected", priority=GLib.PRIORITY_DEFAULT)
+                    raise
 
     async def _execute_tool_call_with_approval(
         self,
@@ -1442,7 +1595,7 @@ class MainWindow(Gtk.ApplicationWindow):
                     f"Intent Validation failed for Task {iteration_num}: {validation_response.get('error')}",
                     priority=GLib.PRIORITY_DEFAULT,
                 )
-                return # Stop agent run on validation failure
+                
 
             validation_result = validation_response.get("result", {})
             GLib.idle_add(
@@ -1468,7 +1621,7 @@ class MainWindow(Gtk.ApplicationWindow):
                     "uncompleted", # Mark as uncompleted for reconsideration
                     priority=GLib.PRIORITY_DEFAULT,
                 )
-                return # Stop agent run if validation says not to proceed
+                
 
             # --- Phase 2: Design Draft ---
             GLib.idle_add(
@@ -1508,210 +1661,185 @@ class MainWindow(Gtk.ApplicationWindow):
             )
             
             # --- Phase 3: Implementation ---
-            GLib.idle_add(
-                self._add_agent_progress_message,
-                conversation_id,
-                f"Phase 3: Implementing task {iteration_num}...",
-                priority=GLib.PRIORITY_DEFAULT,
-            )
+            implementation_attempts = 0
+            max_implementation_attempts = 3
+            compile_ok = False
             
-            # This is the existing implementation logic, encapsulated
-            implementation_instruction = (
-                f"{global_context}"
-                f"Execute exactly this one task now: {task_text}\n"
-                "Use tools if needed. After finishing, summarize what changed."
-            )
-            temp_conv = Conversation(
-                id=conv_live.id,
-                title=conv_live.title,
-                messages=list(conv_live.messages),
-                created_at=conv_live.created_at,
-                updated_at=conv_live.updated_at,
-                model=conv_live.model,
-                total_tokens=conv_live.total_tokens,
-                chat_settings=conv_live.chat_settings,
-                ai_tasks=list(live_tasks),
-                chat_mode=conv_live.chat_mode,
-                agent_config=conv_live.agent_config,
-                active_context_files=conv_live.active_context_files,
-            )
-            temp_conv.add_message(
-                Message(
-                    id=str(uuid.uuid4()),
-                    role=MessageRole.USER,
-                    content=implementation_instruction,
-                )
-            )
+            while implementation_attempts < max_implementation_attempts:
+                implementation_attempts += 1
 
-            # Agent calls can occasionally time out while local model is busy.
-            # Retry once after a short pause before failing the whole run.
-            response_text = None
-            tool_events = []
-            last_err: Optional[Exception] = None
-            for attempt in range(2):
-                try:
-                    response_text, tool_events, _ = await self._get_api_response(
-                        temp_conv,
-                        settings,
-                        mode="agent",
-                    )
-                    last_err = None
-                    break
-                except Exception as e:
-                    last_err = e
-                    err_text = str(e).lower()
-                    is_timeout = ("timed out" in err_text) or ("timeout" in err_text)
-                    if (attempt == 0) and is_timeout:
-                        if self._is_agent_stop_requested(conversation_id):
-                            GLib.idle_add(
-                                self._add_agent_progress_message,
-                                conversation_id,
-                                "Agent run paused by user.",
-                                priority=GLib.PRIORITY_DEFAULT,
-                            )
-                            return
-                        GLib.idle_add(
-                            self._add_agent_progress_message,
-                            conversation_id,
-                            "Model request timed out. Waiting 10 seconds, then retrying...",
-                            priority=GLib.PRIORITY_DEFAULT,
-                        )
-                        await asyncio.sleep(10)
-                        if self._is_agent_stop_requested(conversation_id):
-                            GLib.idle_add(
-                                self._add_agent_progress_message,
-                                conversation_id,
-                                "Agent run paused by user.",
-                                priority=GLib.PRIORITY_DEFAULT,
-                            )
-                            return
-                        continue
-                    break
-            if last_err is not None:
-                raise last_err
-            if self._is_agent_stop_requested(conversation_id):
                 GLib.idle_add(
                     self._add_agent_progress_message,
                     conversation_id,
-                    "Agent run paused by user. Resume in Agent mode to continue.",
+                    f"Phase 3: Implementing task {iteration_num} (Attempt {implementation_attempts}/{max_implementation_attempts})...",
+                    priority=GLib.PRIORITY_DEFAULT,
+                )
+
+                implementation_instruction = (
+                    f"{global_context}"
+                    f"Execute exactly this one task now: {task_text}\n"
+                    "Use tools if needed. After finishing, summarize what changed."
+                )
+                temp_conv = Conversation(
+                    id=conv_live.id,
+                    title=conv_live.title,
+                    messages=list(conv_live.messages),
+                    created_at=conv_live.created_at,
+                    updated_at=conv_live.updated_at,
+                    model=conv_live.model,
+                    total_tokens=conv_live.total_tokens,
+                    chat_settings=conv_live.chat_settings,
+                    ai_tasks=list(live_tasks),
+                    chat_mode=conv_live.chat_mode,
+                    agent_config=conv_live.agent_config,
+                    active_context_files=conv_live.active_context_files,
+                )
+                temp_conv.add_message(
+                    Message(
+                        id=str(uuid.uuid4()),
+                        role=MessageRole.USER,
+                        content=implementation_instruction,
+                    )
+                )
+
+                response_text, tool_events, _ = await self._get_api_response(
+                    temp_conv,
+                    settings,
+                    mode="agent",
+                )
+
+                if tool_events:
+                    for event in tool_events:
+                        GLib.idle_add(
+                            self._add_agent_activity_log,
+                            conversation_id,
+                            event,
+                            iteration_num,
+                            priority=GLib.PRIORITY_DEFAULT,
+                        )
+
+                GLib.idle_add(
+                    self._add_assistant_message_and_save,
+                    response_text or f"[Agent] Task {iteration_num} completed with no summary.",
+                    conversation_id,
+                    tool_events,
+                    None,
+                    priority=GLib.PRIORITY_DEFAULT,
+                )
+                
+                if self._is_agent_stop_requested(conversation_id):
+                    GLib.idle_add(
+                        self._add_agent_progress_message,
+                        conversation_id,
+                        "Agent run paused by user. Resume in Agent mode to continue.",
+                        priority=GLib.PRIORITY_DEFAULT,
+                    )
+                    return
+
+                compile_ok, compile_detail = await self._run_compile_check(project_dir)
+                if not compile_ok:
+                    GLib.idle_add(
+                        self._add_agent_progress_message,
+                        conversation_id,
+                        f"Compile check failed. Output:\n{compile_detail}",
+                        priority=GLib.PRIORITY_DEFAULT,
+                    )
+                    # Add the compilation error to the conversation history
+                    # so the AI can see it in the next attempt
+                    conv_live.add_message(
+                        Message(
+                            id=str(uuid.uuid4()),
+                            role=MessageRole.ASSISTANT,
+                            content=f"Compilation failed with the following output:\n{compile_detail}",
+                        )
+                    )
+                    continue # Try to implement the same task again
+                else:
+                    # Compile check passed, break the loop
+                    break
+            
+            if not compile_ok:
+                GLib.idle_add(
+                    self._add_agent_progress_message,
+                    conversation_id,
+                    f"Agent failed to fix compilation errors for task {iteration_num} after {max_implementation_attempts} attempts. Agent stopped.",
                     priority=GLib.PRIORITY_DEFAULT,
                 )
                 return
 
-            # Add detailed activity log for each tool event
-            if tool_events:
-                for event in tool_events:
-                    GLib.idle_add(
-                        self._add_agent_activity_log,
-                        conversation_id,
-                        event,
-                        iteration_num,
-                        priority=GLib.PRIORITY_DEFAULT,
-                    )
-
-            GLib.idle_add(
-                self._add_assistant_message_and_save,
-                response_text or f"[Agent] Task {iteration_num} completed with no summary.",
-                conversation_id,
-                tool_events,
-                None,
-                priority=GLib.PRIORITY_DEFAULT,
-            )
-            if tool_events:
-                GLib.idle_add(
-                    self._add_agent_progress_message,
-                    conversation_id,
-                    self._format_agent_tool_output(iteration_num, tool_events),
-                    priority=GLib.PRIORITY_DEFAULT,
-                )
-
-            compile_ok, compile_detail = await self._run_compile_check(project_dir)
-            compile_status = {"ok": compile_ok, "detail": compile_detail}
-            if not compile_ok:
-                GLib.idle_add(
-                    self._set_task_status_and_save,
-                    conversation_id,
-                    task_index,
-                    "uncompleted",
-                    priority=GLib.PRIORITY_DEFAULT,
-                )
-                GLib.idle_add(
-                    self._add_agent_progress_message,
-                    conversation_id,
-                    "Compile check failed. Agent stopped.\n"
-                    f"{compile_detail}",
-                    priority=GLib.PRIORITY_DEFAULT,
-                )
-                return # Stop agent run on compile failure
+            compile_status = {"ok": True, "detail": "Compilation successful."}
 
             # --- Phase 4: Post-Implementation Critique ---
-            GLib.idle_add(
-                self._add_agent_progress_message,
-                conversation_id,
-                f"Phase 4: Critiquing implementation for task {iteration_num}...",
-                priority=GLib.PRIORITY_DEFAULT,
-            )
-            critique_response = await self._phase4_post_implementation_critique(
-                conversation=conv_live,
-                conversation_id=conversation_id,
-                settings=settings,
-                user_text=user_text,
-                task_text=task_text,
-                global_context=global_context,
-                implementation_summary=implementation_summary,
-                iteration_num=iteration_num,
-                compile_status=compile_status,
-            )
-
-            if not critique_response.get("ok"):
+            if self.tools_bar.get_critique_enabled():
                 GLib.idle_add(
                     self._add_agent_progress_message,
                     conversation_id,
-                    f"Post-Implementation Critique failed for Task {iteration_num}: {critique_response.get('error')}",
+                    f"Phase 4: Critiquing implementation for task {iteration_num}...",
                     priority=GLib.PRIORITY_DEFAULT,
                 )
-                return # Stop agent run on critique failure
+                implementation_summary = response_text or ""
+                critique_response = await self._phase4_post_implementation_critique(
+                    conversation=conv_live,
+                    conversation_id=conversation_id,
+                    settings=settings,
+                    user_text=user_text,
+                    task_text=task_text,
+                    global_context=global_context,
+                    implementation_summary=implementation_summary,
+                    iteration_num=iteration_num,
+                    compile_status=compile_status,
+                )
 
-            critique_result = critique_response.get("result", {})
-            GLib.idle_add(
-                self._add_assistant_message_and_save,
-                f"[Agent - Phase 4 Critique]\n{json.dumps(critique_result, indent=2)}",
-                conversation_id,
-                [],
-                None,
-                priority=GLib.PRIORITY_DEFAULT,
-            )
-
-            if critique_result.get("flaws_found"):
-                new_tasks = critique_result.get("new_tasks_needed", [])
-                if new_tasks and isinstance(new_tasks, list):
-                    current_ai_tasks = self._normalize_task_list(conv_live.ai_tasks)
-                    for new_task_desc in new_tasks:
-                        current_ai_tasks.append({"text": new_task_desc, "done": False, "status": "uncompleted"})
-                    conv_live.ai_tasks = current_ai_tasks
-                    self._save_conversations()
-                    self.sidebar.set_ai_tasks(conversation_id, current_ai_tasks)
+                if not critique_response.get("ok"):
                     GLib.idle_add(
                         self._add_agent_progress_message,
                         conversation_id,
-                        f"Critique found flaws. Added {len(new_tasks)} new tasks for reconsideration.",
+                        f"Post-Implementation Critique failed for Task {iteration_num}: {critique_response.get('error')}",
                         priority=GLib.PRIORITY_DEFAULT,
                     )
-                else:
-                    GLib.idle_add(
-                        self._add_agent_progress_message,
-                        conversation_id,
-                        "Critique found flaws but no new tasks were suggested. Agent run stopped.",
-                        priority=GLib.PRIORITY_DEFAULT,
-                    )
+                    return # Stop agent run on critique failure
+
+                critique_result = critique_response.get("result", {})
                 GLib.idle_add(
-                    self._set_task_status_and_save,
+                    self._add_assistant_message_and_save,
+                    f"[Agent - Phase 4 Critique]\n{json.dumps(critique_result, indent=2)}",
                     conversation_id,
-                    task_index,
-                    "uncompleted", # Mark as uncompleted for reconsideration
+                    [],
+                    None,
                     priority=GLib.PRIORITY_DEFAULT,
                 )
-                return # Stop agent run if flaws found
+
+                if critique_result.get("flaws_found"):
+                    new_tasks = critique_result.get("new_tasks_needed", [])
+                    if new_tasks and isinstance(new_tasks, list):
+                        current_ai_tasks = self._normalize_task_list(conv_live.ai_tasks)
+                        for new_task_desc in new_tasks:
+                            current_ai_tasks.append({"text": new_task_desc, "done": False, "status": "uncompleted"})
+                        conv_live.ai_tasks = current_ai_tasks
+                        self._save_conversations()
+                        self.sidebar.set_ai_tasks(conversation_id, current_ai_tasks)
+                        GLib.idle_add(
+                            self._add_agent_progress_message,
+                            conversation_id,
+                            f"Critique found flaws. Added {len(new_tasks)} new tasks.",
+                            priority=GLib.PRIORITY_DEFAULT,
+                        )
+                    else:
+                        GLib.idle_add(
+                            self._add_agent_progress_message,
+                            conversation_id,
+                            "Critique found flaws but no new tasks were suggested.",
+                            priority=GLib.PRIORITY_DEFAULT,
+                        )
+                    GLib.idle_add(
+                        self._set_task_status_and_save,
+                        conversation_id,
+                        task_index,
+                        "uncompleted", # Mark as uncompleted for reconsideration
+                        priority=GLib.PRIORITY_DEFAULT,
+                    )
+            # --- End of Phase 4 ---
+
 
             GLib.idle_add(
                 self._add_agent_progress_message,
@@ -2197,9 +2325,9 @@ class MainWindow(Gtk.ApplicationWindow):
                     "Respond with strict JSON only and no extra text."
                 ),
             )
-            raw = await self.api_client.chat_completion_with_tools(
-                conversation=temp_conv,
-                settings=review_settings,
+            raw = await self._chat_with_retries(
+                temp_conv,
+                review_settings,
                 tool_executor=None,
             )
             needs_info, assistant_message, updated_tasks = self._parse_plan_review_response(
@@ -2353,7 +2481,7 @@ class MainWindow(Gtk.ApplicationWindow):
         dir_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         dir_entry = Gtk.Entry()
         dir_entry.set_hexpand(True)
-        dir_entry.set_text(project_dir or self.workspace_root)
+        dir_entry.set_text(project_dir or self._get_workspace_root())
         browse_btn = Gtk.Button(label="Browse…")
 
         def _on_browse_clicked(_btn):
@@ -2401,6 +2529,12 @@ class MainWindow(Gtk.ApplicationWindow):
         if not selected_dir:
             self._show_error_dialog(
                 "Agent Setup", "Project directory is required.")
+            return False
+        # Prevent selecting a project directory that is inside the application repo
+        app_root = getattr(self, "_app_root", os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+        sel_abs = os.path.abspath(selected_dir)
+        if sel_abs == app_root or sel_abs.startswith(app_root + os.sep):
+            self._show_error_dialog("Agent Setup", "Selected project directory is inside the application directory. Choose a directory outside the app source to allow filesystem tools.")
             return False
         if not os.path.isdir(selected_dir):
             try:
@@ -2542,13 +2676,20 @@ class MainWindow(Gtk.ApplicationWindow):
             ),
         )
         try:
-            raw_response = await self.api_client.chat_completion_with_tools(
-                conversation=temp_conv,
-                settings=validation_settings,
+            raw_response = await self._chat_with_retries(
+                temp_conv,
+                validation_settings,
                 tool_executor=None,
             )
-            validation_result = json.loads(raw_response)
+            # Parse JSON robustly: try full parse first, then extract JSON object region.
+            validation_result = None
+            try:
+                validation_result = json.loads(raw_response)
+            except Exception:
+                validation_result = self._parse_json_object_from_text(raw_response)
+
             if not isinstance(validation_result, dict):
+                logger.error("Intent validation returned non-JSON or empty response. Raw: %s", (raw_response or "<empty>")[:1000])
                 raise ValueError("AI returned invalid JSON for intent validation.")
             return {"ok": True, "result": validation_result}
         except Exception as e:
@@ -2617,9 +2758,9 @@ class MainWindow(Gtk.ApplicationWindow):
             ),
         )
         try:
-            raw_response = await self.api_client.chat_completion_with_tools(
-                conversation=temp_conv,
-                settings=design_settings,
+            raw_response = await self._chat_with_retries(
+                temp_conv,
+                design_settings,
                 tool_executor=None,
             )
             return {"ok": True, "result": raw_response}
@@ -2700,14 +2841,21 @@ class MainWindow(Gtk.ApplicationWindow):
             ),
         )
         try:
-            raw_response = await self.api_client.chat_completion_with_tools(
-                conversation=temp_conv,
-                settings=critique_settings,
+            raw_response = await self._chat_with_retries(
+                temp_conv,
+                critique_settings,
                 tool_executor=None,
             )
-            critique_result = json.loads(raw_response)
+            # Parse JSON robustly
+            critique_result = None
+            try:
+                critique_result = json.loads(raw_response)
+            except Exception:
+                critique_result = self._parse_json_object_from_text(raw_response)
+
             if not isinstance(critique_result, dict):
-                raise ValueError("AI returned invalid JSON for post-implementation critique.")
+                logger.error("Post-implementation critique returned non-JSON or empty response. Raw: %s", (raw_response or "<empty>")[:1000])
+                return {"ok": False, "error": "Post-implementation critique failed: invalid JSON response from model."}
             return {"ok": True, "result": critique_result}
         except Exception as e:
             logger.error("Error during post-implementation critique: %s", e)
@@ -2738,20 +2886,20 @@ class MainWindow(Gtk.ApplicationWindow):
                 break
         
         if message_to_repush and repush_index != -1:
-            # Clear all messages from this one onwards (inclusive) for a true "reiterate from"
-            # The prompt says "clear all messages after the selected one", so keep selected.
-            self.current_conversation.messages = self.current_conversation.messages[:repush_index + 1]
+            # Remove the selected user message so the new send doesn't create a duplicate.
+            # Also clear any subsequent messages (they are being replaced by the new run).
+            self.current_conversation.messages = self.current_conversation.messages[:repush_index]
             self._save_conversations()
-            
+
             # Refresh chat area to reflect cleared messages
             self.chat_area.set_conversation(
                 self.current_conversation,
                 self._get_effective_settings(self.current_conversation).context_limit
             )
-            
-            # Now simulate sending the message content
+
+            # Now simulate sending the message content as a fresh user message
             self.chat_input.set_text(message_to_repush.content)
-            self._on_send_message(None) # Simulate send button click
+            self._on_send_message(None)  # Simulate send button click
 
     def _on_delete_message(self, message_id: str) -> None:
         """Handle request to delete a message."""
@@ -2972,10 +3120,13 @@ class MainWindow(Gtk.ApplicationWindow):
             A JSON string indicating success or failure.
         """
         project_index_data = self._load_project_index()
-        
-        # Ensure file_path is relative to workspace_root
-        abs_file_path = os.path.join(self.workspace_root, file_path)
-        relative_file_path = os.path.relpath(abs_file_path, self.workspace_root)
+
+        # Use effective workspace root so agent project_dir is respected
+        root = self._get_workspace_root()
+
+        # Ensure file_path is relative to workspace root
+        abs_file_path = os.path.join(root, file_path)
+        relative_file_path = os.path.relpath(abs_file_path, root)
 
         project_index_data[relative_file_path] = {
             "purpose": purpose,
@@ -2984,31 +3135,16 @@ class MainWindow(Gtk.ApplicationWindow):
             "key_responsibilities": key_responsibilities or [],
             "known_issues": known_issues or [],
         }
-        handler = handlers.get(tool_name)
-        if handler is not None:
-            result = await handler(args or {})
-            return json.dumps(result, ensure_ascii=False)
 
-        # If this tool belongs to an MCP endpoint, call tools/call on that
-        # endpoint.
-        if mcp_tool_map and tool_name in mcp_tool_map and isinstance(
-                server_configs, dict):
-            meta = mcp_tool_map[tool_name]
-            integration_id = str(meta.get("integration_id", "")).strip()
-            raw_tool_name = str(
-                meta.get(
-                    "mcp_tool_name",
-                    "")).strip() or tool_name
-            server = server_configs.get(integration_id, {})
-            cfg = server.get("config") if isinstance(server, dict) else None
-            if isinstance(cfg, dict):
-                result = await self.mcp_discovery.call_tool(
-                    integration_id=integration_id,
-                    tool_name=raw_tool_name,
-                    arguments=args or {},
-                    cfg=cfg,
-                )
-                return json.dumps(result, ensure_ascii=False)
+        # Persist the updated PROJECT_INDEX.json
+        index_path = os.path.join(root, "PROJECT_INDEX.json")
+        try:
+            # write_file expects bytes and is async in this codebase
+            await write_file(index_path, json.dumps(project_index_data, indent=2, ensure_ascii=False).encode("utf-8"))
+            return json.dumps({"ok": True, "message": "PROJECT_INDEX.json updated"}, ensure_ascii=False)
+        except Exception as e:
+            logger.error("Failed to update PROJECT_INDEX.json: %s", e)
+            return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
 
     async def _update_project_constitution_tool(self, new_content: str) -> str:
         """
@@ -3024,7 +3160,8 @@ class MainWindow(Gtk.ApplicationWindow):
         Returns:
             A JSON string indicating success or failure.
         """
-        constitution_path = os.path.join(self.workspace_root, "PROJECT_CONSTITUTION.md")
+        root = self._get_workspace_root()
+        constitution_path = os.path.join(root, "PROJECT_CONSTITUTION.md")
         try:
             # Using the imported write_file utility
             await write_file(constitution_path, new_content.encode('utf-8'))
@@ -3246,7 +3383,11 @@ class MainWindow(Gtk.ApplicationWindow):
         max_results = max(1, min(max_results, 2000))
         target = self._safe_path(rel_path)
         if not target or not os.path.isdir(target):
-            return {"ok": False, "error": "Invalid directory path. Must be within the workspace."}
+            if getattr(self, "_last_safe_root_blocked", False):
+                app_root = getattr(self, "_app_root", "<app_root>")
+                return {"ok": False, "error": f"Operation denied: project workspace root is inside the application directory ({app_root}). Set a project directory outside the application directory to allow filesystem operations."}
+            allowed = getattr(self, "_last_safe_root", self._get_workspace_root())
+            return {"ok": False, "error": f"Invalid directory path. Path must be inside project workspace: {allowed}"}
         names = sorted(os.listdir(target))[:max_results]
         return {
             "ok": True,
@@ -3266,7 +3407,11 @@ class MainWindow(Gtk.ApplicationWindow):
         max_chars = max(256, min(max_chars, 50000))
         target = self._safe_path(rel_path)
         if not rel_path or not target or not os.path.isfile(target):
-            return {"ok": False, "error": "Invalid file path. Must be within the workspace."}
+            if getattr(self, "_last_safe_root_blocked", False):
+                app_root = getattr(self, "_app_root", "<app_root>")
+                return {"ok": False, "error": f"Operation denied: project workspace root is inside the application directory ({app_root}). Set a project directory outside the application directory to allow filesystem operations."}
+            allowed = getattr(self, "_last_safe_root", self._get_workspace_root())
+            return {"ok": False, "error": f"Invalid file path. Path must be inside project workspace: {allowed}"}
         try:
             with open(target, "r", encoding="utf-8", errors="replace") as f:
                 content = f.read(max_chars + 1)
@@ -3297,7 +3442,11 @@ class MainWindow(Gtk.ApplicationWindow):
         if not pattern:
             return {"ok": False, "error": "Missing 'pattern'"}
         if not target or not os.path.isdir(target):
-            return {"ok": False, "error": "Invalid search path. Must be within the workspace."}
+            if getattr(self, "_last_safe_root_blocked", False):
+                app_root = getattr(self, "_app_root", "<app_root>")
+                return {"ok": False, "error": f"Operation denied: project workspace root is inside the application directory ({app_root}). Set a project directory outside the application directory to allow filesystem operations."}
+            allowed = getattr(self, "_last_safe_root", self._get_workspace_root())
+            return {"ok": False, "error": f"Invalid search path. Path must be inside project workspace: {allowed}"}
 
         cmd = ["rg", "-n", "--max-count", str(max_results), pattern, target]
         try:
@@ -3342,9 +3491,11 @@ class MainWindow(Gtk.ApplicationWindow):
         timeout_s = float(args.get("timeout_sec", 10))
         timeout_s = max(1.0, min(timeout_s, 20.0))
         try:
+            # Run commands from effective workspace root to sandbox filesystem tools
+            cwd = self._get_workspace_root()
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
-                cwd=self.workspace_root,
+                cwd=cwd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -3415,9 +3566,9 @@ class MainWindow(Gtk.ApplicationWindow):
         try:
             # Call LM Studio API for summarization
             # We use a fresh session as this might be called from a background thread
-            summarized_json_str = await self.api_client.chat_completion_with_tools(
-                conversation=temp_conv,
-                settings=settings,
+            summarized_json_str = await self._chat_with_retries(
+                temp_conv,
+                settings,
                 tool_executor=None, # No tools for the summarization call itself
             )
             
@@ -3542,6 +3693,14 @@ class MainWindow(Gtk.ApplicationWindow):
             logger.error("Error adding entry to DECISION_LOG.md: %s", e)
             return {"ok": False, "error": f"Failed to add decision log entry: {e}"}
 
+    async def _tool_perform_milestone_review(self, args: dict) -> dict:
+        """Placeholder for milestone review tool.
+
+        Milestone review is only supported in agent mode. When invoked outside
+        of agent mode, return a clear error so callers don't crash.
+        """
+        return {"ok": False, "error": "Milestone review is only available in agent mode."}
+
 
     async def _tool_builtin_write_file(self, args: dict) -> dict:
         """Built-in filesystem write/overwrite tool."""
@@ -3583,16 +3742,17 @@ class MainWindow(Gtk.ApplicationWindow):
             return {"ok": False, "error": "'find' must not be empty"}
         try:
             with open(target, "r", encoding="utf-8", errors="replace") as f:
-                content = f.read()
-            count = content.count(find_text)
+                original_content = f.read()
+            count = original_content.count(find_text)
             if count == 0:
                 return {"ok": False, "error": "Text to replace was not found"}
             if replace_all:
-                updated = content.replace(find_text, replace_text)
+                updated_content = original_content.replace(find_text, replace_text)
                 replaced = count
             else:
-                updated = content.replace(find_text, replace_text, 1)
+                updated_content = original_content.replace(find_text, replace_text, 1)
                 replaced = 1
+            # Write updated content
             with open(target, "w", encoding="utf-8") as f:
                 f.write(updated_content)
 
@@ -3603,7 +3763,7 @@ class MainWindow(Gtk.ApplicationWindow):
                 tofile=rel_path + " (modified)",
                 lineterm=""
             ))
-            
+
             return {
                 "ok": True,
                 "path": rel_path,
@@ -3641,7 +3801,11 @@ class MainWindow(Gtk.ApplicationWindow):
 
         target = self._safe_path(rel_path)
         if not target or not os.path.isdir(target):
-            return {"ok": False, "error": "Invalid directory path"}
+            if getattr(self, "_last_safe_root_blocked", False):
+                app_root = getattr(self, "_app_root", "<app_root>")
+                return {"ok": False, "error": f"Operation denied: project workspace root is inside the application directory ({app_root}). Set a project directory outside the application directory to allow filesystem operations."}
+            allowed = getattr(self, "_last_safe_root", self._get_workspace_root())
+            return {"ok": False, "error": f"Invalid directory path. Path must be inside project workspace: {allowed}"}
 
         try:
             entries = []
@@ -3685,10 +3849,12 @@ class MainWindow(Gtk.ApplicationWindow):
             return {
                 "ok": True,
                 "path": rel_path,
-                "deleted": True,
+                "entries": entries,
+                "count": len(entries),
                 "details": {
-                    "type": "file_delete",
+                    "type": "file_listing",
                     "path": rel_path,
+                    "entries": [e.get("name") for e in entries],
                 }
             }
         except Exception as e:
@@ -3712,7 +3878,11 @@ class MainWindow(Gtk.ApplicationWindow):
 
         target = self._safe_path(rel_path)
         if not target or not os.path.isdir(target):
-            return {"ok": False, "error": "Invalid search path"}
+            if getattr(self, "_last_safe_root_blocked", False):
+                app_root = getattr(self, "_app_root", "<app_root>")
+                return {"ok": False, "error": f"Operation denied: project workspace root is inside the application directory ({app_root}). Set a project directory outside the application directory to allow filesystem operations."}
+            allowed = getattr(self, "_last_safe_root", self.workspace_root)
+            return {"ok": False, "error": f"Invalid search path. Path must be inside project workspace: {allowed}"}
 
         try:
             matches = []
@@ -3723,8 +3893,9 @@ class MainWindow(Gtk.ApplicationWindow):
                 if search_type in ("directories", "both"):
                     for dirname in dirs:
                         if fnmatch.fnmatch(dirname, pattern):
+                            root_dir = self._get_workspace_root()
                             rel_match = os.path.relpath(os.path.join(
-                                root, dirname), self.workspace_root)
+                                root, dirname), root_dir)
                             matches.append({
                                 "path": rel_match,
                                 "name": dirname,
@@ -3738,8 +3909,9 @@ class MainWindow(Gtk.ApplicationWindow):
                     for filename in files:
                         if fnmatch.fnmatch(filename, pattern):
                             full_path = os.path.join(root, filename)
+                            root_dir = self._get_workspace_root()
                             rel_match = os.path.relpath(
-                                full_path, self.workspace_root)
+                                full_path, root_dir)
                             file_entry = {
                                 "path": rel_match,
                                 "name": filename,
@@ -3810,24 +3982,47 @@ class MainWindow(Gtk.ApplicationWindow):
 
     def _safe_path(self, path_value: str) -> Optional[str]:
         """Resolve path within workspace root only."""
-        candidate = os.path.abspath(
-            os.path.join(
-                self.workspace_root,
-                path_value))
-        root = self.workspace_root + os.sep
-        if candidate == self.workspace_root or candidate.startswith(root):
+        # Use effective workspace root which may be overridden in agent mode
+        root_dir = self._get_workspace_root()
+        # Determine application code root (two levels up from this file)
+        app_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        # Record for diagnostics
+        self._last_safe_root = root_dir
+        self._app_root = app_root
+        # If the workspace root is inside the application code directory, deny access.
+        try:
+            in_app = (root_dir == app_root) or root_dir.startswith(app_root + os.sep)
+        except Exception:
+            in_app = False
+        self._last_safe_root_blocked = bool(in_app)
+        if self._last_safe_root_blocked:
+            return None
+
+        candidate = os.path.abspath(os.path.join(root_dir, path_value))
+        root = root_dir + os.sep
+        if candidate == root_dir or candidate.startswith(root):
             return candidate
         return None
 
     def _get_workspace_root(self) -> str:
         """Return the effective workspace root for the current context."""
+        # Prefer per-conversation agent project_dir when valid and not inside app code
         if self.current_conversation:
             if self.current_conversation.chat_mode == "agent":
                 cfg = self.current_conversation.agent_config
                 if isinstance(cfg, dict):
                     proj_dir = str(cfg.get("project_dir", "")).strip()
                     if proj_dir and os.path.isdir(proj_dir):
-                        return os.path.abspath(proj_dir)
+                        try:
+                            proj_dir_abs = os.path.abspath(proj_dir)
+                            # Reject project dirs that are inside the application code
+                            app_root = getattr(self, "_app_root", os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+                            if proj_dir_abs == app_root or proj_dir_abs.startswith(app_root + os.sep):
+                                logger.warning("Ignoring agent project_dir inside app repo: %s", proj_dir_abs)
+                            else:
+                                return proj_dir_abs
+                        except Exception:
+                            pass
         return self.workspace_root
 
     def _default_model_name(self) -> str:
@@ -3850,6 +4045,36 @@ class MainWindow(Gtk.ApplicationWindow):
             self.tools_bar.set_tool_enabled(integration_id, True)
         self.tools_panel.pack_start(self.tools_bar, True, True, 0)
         self.tools_panel.show_all()
+        # Ensure default enables reflect current mode after reload
+        try:
+            self._apply_default_tool_enables(self.chat_input.get_mode())
+        except Exception:
+            pass
+
+    def _apply_default_tool_enables(self, mode: str) -> None:
+        """Enable commonly-used integrations by default when in Agent mode.
+
+        These integrations are disabled in Ask/Plan modes to avoid accidental tool use.
+        """
+        defaults = [
+            "mcp/builtin_filesystem",
+            "mcp/serpapi",
+            "mcp/CLI Access",
+        ]
+        if not hasattr(self, "tools_bar") or not self.tools_bar:
+            return
+        if mode == "agent":
+            for iid in defaults:
+                try:
+                    self.tools_bar.set_tool_enabled(iid, True)
+                except Exception:
+                    pass
+        else:
+            for iid in defaults:
+                try:
+                    self.tools_bar.set_tool_enabled(iid, False)
+                except Exception:
+                    pass
 
     def _on_add_mcp_server_clicked(self, _button=None) -> None:
         """Prompt for MCP server details and save app-local config."""

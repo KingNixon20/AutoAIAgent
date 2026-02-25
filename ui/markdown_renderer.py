@@ -147,71 +147,132 @@ def extract_ai_tasks_and_response(content: str) -> tuple[list[dict], str]:
 def _parse_markdown_segments(text: str) -> list[tuple[str, str | None]]:
     """Parse markdown and return list of (content, format_type) segments.
     
-    format_type: None (normal), "bold", "italic", "code", "code_block"
+    format_type: None (normal), "bold", "italic", "code", "code_block", 
+                 "h1", "h2", "h3", "list_item", "blockquote"
     """
     segments = []
-    i = 0
+    lines = text.split('\n')
     
-    while i < len(text):
-        # Code block (```...```)
-        if text[i:i+3] == "```":
-            end = text.find("```", i + 3)
-            if end == -1:
-                segments.append((text[i:], None))
-                break
-            code_content = text[i+3:end].strip()
-            segments.append((code_content, "code_block"))
-            i = end + 3
+    in_code_block = False
+    current_code_block_content = []
+
+    for line_num, line in enumerate(lines):
+        # Handle code blocks
+        if line.strip().startswith("```"):
+            if in_code_block:
+                segments.append(("\n".join(current_code_block_content), "code_block"))
+                current_code_block_content = []
+                in_code_block = False
+            else:
+                in_code_block = True
+            # Add a newline for block separation
+            if line_num < len(lines) - 1 or segments and segments[-1][1] != "code_block":
+                 segments.append(("\n", None))
             continue
         
-        # Inline code (`...`) - single backtick
-        if text[i] == "`" and (i + 2 >= len(text) or text[i:i+3] != "```"):
-            end = text.find("`", i + 1)
-            if end != -1:
-                segments.append((text[i+1:end], "code"))
-                i = end + 1
-                continue
+        if in_code_block:
+            current_code_block_content.append(line)
+            continue
+
+        # Handle block-level elements (headings, blockquotes, list items)
+        # These should start a new line and consume the whole line
+        if line.startswith("# "):
+            segments.append((line[2:], "h1"))
+            segments.append(("\n", None))
+            continue
+        if line.startswith("## "):
+            segments.append((line[3:], "h2"))
+            segments.append(("\n", None))
+            continue
+        if line.startswith("### "):
+            segments.append((line[4:], "h3"))
+            segments.append(("\n", None))
+            continue
+        if line.startswith("> "):
+            segments.append((line[2:], "blockquote"))
+            segments.append(("\n", None))
+            continue
+        if line.startswith("* ") or line.startswith("- "):
+            segments.append(("\u2022 " + line[2:], "list_item"))
+            segments.append(("\n", None))
+            continue
+
+        # Process inline elements for normal lines
+        i = 0
+        line_segments = []
+        while i < len(line):
+            # Inline code (`...`) - handle before bold/italic to prevent issues with `**` inside code
+            if line[i] == '`' and (i == 0 or line[i-1] != '\\'): # Ensure it's not an escaped backtick
+                end = -1
+                for j in range(i + 1, len(line)):
+                    if line[j] == '`' and (j == 0 or line[j-1] != '\\'):
+                        end = j
+                        break
+                if end != -1:
+                    line_segments.append((line[i+1:end], "code"))
+                    i = end + 1
+                    continue
+            
+            # Bold (**text** or __text__)
+            if line[i:i+2] == "**":
+                end = line.find("**", i + 2)
+                if end != -1:
+                    line_segments.append((line[i+2:end], "bold"))
+                    i = end + 2
+                    continue
+            if line[i:i+2] == "__":
+                end = line.find("__", i + 2)
+                if end != -1:
+                    line_segments.append((line[i+2:end], "bold"))
+                    i = end + 2
+                    continue
+            
+            # Italic (*text* or _text_)
+            if line[i] == "*" and (i == 0 or line[i-1] != '\\'):
+                end = -1
+                for j in range(i + 1, len(line)):
+                    if line[j] == '*' and (j == 0 or line[j-1] != '\\'):
+                        if line[j-1:j+1] != "**": # Avoid matching **
+                            end = j
+                            break
+                if end != -1:
+                    line_segments.append((line[i+1:end], "italic"))
+                    i = end + 1
+                    continue
+            if line[i] == "_" and (i == 0 or line[i-1] != '\\'):
+                end = -1
+                for j in range(i + 1, len(line)):
+                    if line[j] == '_' and (j == 0 or line[j-1] != '\\'):
+                        if line[j-1:j+1] != "__": # Avoid matching __
+                            end = j
+                            break
+                if end != -1:
+                    line_segments.append((line[i+1:end], "italic"))
+                    i = end + 1
+                    continue
+            
+            # Normal text - find next special char
+            next_inline_token_pos = len(line)
+            for delim in ("`", "**", "__", "*", "_"):
+                idx = line.find(delim, i)
+                if idx != -1:
+                    next_inline_token_pos = min(next_inline_token_pos, idx)
+            
+            if next_inline_token_pos > i:
+                line_segments.append((line[i:next_inline_token_pos], None))
+                i = next_inline_token_pos
+            else:
+                line_segments.append((line[i], None))
+                i += 1
         
-        # Bold (**text** or __text__)
-        if text[i:i+2] in ("**", "__"):
-            delim = text[i:i+2]
-            end = text.find(delim, i + 2)
-            if end != -1:
-                segments.append((text[i+2:end], "bold"))
-                i = end + 2
-                continue
-        
-        # Italic (*text* or _text_) - must not be ** or __
-        if text[i] in "*_" and text[i:i+2] not in ("**", "__"):
-            end = text.find(text[i], i + 1)
-            if end != -1:
-                segments.append((text[i+1:end], "italic"))
-                i = end + 1
-                continue
-        
-        # Normal text - find next special char
-        next_pos = len(text)
-        idx = text.find("```", i)
-        if idx != -1:
-            next_pos = min(next_pos, idx)
-        idx = text.find("`", i)
-        if idx != -1 and text[idx:idx+3] != "```":
-            next_pos = min(next_pos, idx)
-        for delim in ("**", "__"):
-            idx = text.find(delim, i)
-            if idx != -1:
-                next_pos = min(next_pos, idx)
-        for delim in ("*", "_"):
-            idx = text.find(delim, i)
-            if idx != -1 and idx < next_pos and text[idx:idx+2] not in ("**", "__"):
-                next_pos = min(next_pos, idx)
-        
-        if next_pos > i:
-            segments.append((text[i:next_pos], None))
-            i = next_pos
-        else:
-            segments.append((text[i], None))
-            i += 1
+        segments.extend(line_segments)
+        # Add newline after each line unless it's the last line and empty or already handled by block elements
+        if line_num < len(lines) - 1 or line: # Only add newline if not last line OR last line is not empty
+            segments.append(("\n", None))
+
+    # Add any remaining code block content if the file ended unexpectedly
+    if in_code_block and current_code_block_content:
+        segments.append(("\n".join(current_code_block_content), "code_block"))
     
     return segments
 
@@ -222,34 +283,46 @@ def _create_text_tags(table: Gtk.TextTagTable) -> dict[str, Gtk.TextTag]:
     
     # Bold
     tag = Gtk.TextTag(name="bold")
-    tag.set_property("weight", Pango.Weight.BOLD)
     table.add(tag)
     tags["bold"] = tag
     
     # Italic
     tag = Gtk.TextTag(name="italic")
-    tag.set_property("style", Pango.Style.ITALIC)
     table.add(tag)
     tags["italic"] = tag
     
     # Inline code
     tag = Gtk.TextTag(name="code")
-    tag.set_property("font", "Monospace 12")
-    tag.set_property("background", "#2a2a2a")
-    tag.set_property("foreground", "#e0e0e0")
     table.add(tag)
     tags["code"] = tag
     
     # Code block
     tag = Gtk.TextTag(name="code_block")
-    tag.set_property("font", "Monospace 12")
-    tag.set_property("background", "#1e1e1e")
-    tag.set_property("foreground", "#d4d4d4")
-    tag.set_property("indent", 8)
-    tag.set_property("left-margin", 12)
-    tag.set_property("right-margin", 12)
     table.add(tag)
     tags["code_block"] = tag
+
+    # Headings
+    tag = Gtk.TextTag(name="h1")
+    table.add(tag)
+    tags["h1"] = tag
+
+    tag = Gtk.TextTag(name="h2")
+    table.add(tag)
+    tags["h2"] = tag
+
+    tag = Gtk.TextTag(name="h3")
+    table.add(tag)
+    tags["h3"] = tag
+
+    # Blockquote
+    tag = Gtk.TextTag(name="blockquote")
+    table.add(tag)
+    tags["blockquote"] = tag
+
+    # List item
+    tag = Gtk.TextTag(name="list_item")
+    table.add(tag)
+    tags["list_item"] = tag
     
     return tags
 
@@ -270,18 +343,17 @@ def build_formatted_text_view(content: str, max_width: int = 360) -> Gtk.TextVie
     it = buffer.get_start_iter()
     
     for text, fmt in segments:
-        if not text:
+        if not text and fmt is None: # Skip empty normal text segments
             continue
-        if fmt == "code_block":
-            buffer.insert(it, "\n")
-            buffer.insert_with_tags_by_name(it, text, "code_block")
-            buffer.insert(it, "\n")
-        elif fmt:
+        
+        # Insert text and apply tag
+        if fmt:
             buffer.insert_with_tags_by_name(it, text, fmt)
         else:
             buffer.insert(it, text)
     
     view = ClampedTextView(buffer=buffer, max_width=max_width)
+    view.get_style_context().add_class('markdown-view')
     view.set_editable(False)
     view.set_cursor_visible(False)
     # WORD_CHAR prevents extremely long unbroken tokens (URLs/JSON/base64)
@@ -293,9 +365,10 @@ def build_formatted_text_view(content: str, max_width: int = 360) -> Gtk.TextVie
     view.set_bottom_margin(4)
     view.set_pixels_above_lines(2)
     view.set_pixels_below_lines(2)
-    # Enforce a practical max width so natural size cannot explode on Wayland.
-    view.set_size_request(max_width, -1)
-    view.set_hexpand(False)
+    # Allow flexible width up to max_width, not a hard requirement
+    # Use -1 for width to let parent container control width, but max_width for clamping
+    view.set_size_request(-1, -1)
+    view.set_hexpand(True)
     view.set_halign(Gtk.Align.FILL)
     # Transparent background - inherits from parent bubble
     view.override_background_color(Gtk.StateFlags.NORMAL, Gdk.RGBA(0, 0, 0, 0))

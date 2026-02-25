@@ -87,6 +87,8 @@ WINDOW_MAX_HEIGHT = 1440
 WINDOW_DEFAULT_RATIO = 0.45
 # Fraction of screen width to allocate to the sidebar by default
 DEFAULT_SIDEBAR_RATIO = 0.35
+# Fraction of screen width to allocate to the tools panel by default
+DEFAULT_TOOLS_PANEL_RATIO = 0.25
 
 # Optional fixed startup window size (pixels). If set, these override the
 # responsive WINDOW_DEFAULT_RATIO behavior but are still clamped to min/max.

@@ -6,7 +6,8 @@ import os
 from datetime import datetime
 from typing import Optional
 
-from models import Conversation, Message, MessageRole
+from models import Conversation, Message, MessageRole, ConversationSettings
+import constants as C
 
 
 def _get_config_dir() -> str:
@@ -14,6 +15,77 @@ def _get_config_dir() -> str:
     config_dir = os.path.join(os.path.expanduser("~"), ".config", "AutoAIAgent")
     os.makedirs(config_dir, exist_ok=True)
     return config_dir
+
+
+def _settings_to_dict(settings: ConversationSettings) -> dict:
+    """Serialize ConversationSettings to a JSON-serializable dict."""
+    return {
+        "auto_tool_approval": settings.auto_tool_approval,
+        "temperature": settings.temperature,
+        "max_tokens": settings.max_tokens,
+        "top_p": settings.top_p,
+        "repetition_penalty": settings.repetition_penalty,
+        "presence_penalty": settings.presence_penalty,
+        "frequency_penalty": settings.frequency_penalty,
+        "seed": settings.seed,
+        "stop_sequences": settings.stop_sequences,
+        "system_prompt": settings.system_prompt,
+        "context_limit": settings.context_limit,
+        "token_saver": settings.token_saver,
+    }
+
+def _settings_from_dict(data: dict) -> ConversationSettings:
+    """Deserialize ConversationSettings from a dict."""
+    return ConversationSettings(
+        auto_tool_approval=data.get("auto_tool_approval", False),
+        temperature=data.get("temperature", C.DEFAULT_TEMPERATURE),
+        max_tokens=data.get("max_tokens", C.DEFAULT_MAX_TOKENS),
+        top_p=data.get("top_p", C.DEFAULT_TOP_P),
+        repetition_penalty=data.get("repetition_penalty", C.DEFAULT_REPETITION_PENALTY),
+        presence_penalty=data.get("presence_penalty", 0.0),
+        frequency_penalty=data.get("frequency_penalty", 0.0),
+        seed=data.get("seed"), # None if not present
+        stop_sequences=data.get("stop_sequences"), # None if not present
+        system_prompt=data.get("system_prompt", C.DEFAULT_SYSTEM_PROMPT),
+        context_limit=data.get("context_limit", C.DEFAULT_CONTEXT_LIMIT),
+        token_saver=data.get("token_saver", False),
+    )
+
+def _get_settings_path() -> str:
+    """Get path to the global settings data file."""
+    return os.path.join(_get_config_dir(), "settings.json")
+
+def load_settings() -> ConversationSettings:
+    """Load global application settings from disk.
+    
+    Returns:
+        ConversationSettings object, or default settings if file doesn't exist or is invalid.
+    """
+    path = _get_settings_path()
+    if not os.path.exists(path):
+        return ConversationSettings() # Return default settings if file doesn't exist
+    
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return _settings_from_dict(data)
+    except (json.JSONDecodeError, KeyError, ValueError) as e:
+        print(f"Warning: Could not load settings: {e}")
+        return ConversationSettings() # Return default settings on error
+
+def save_settings(settings: ConversationSettings) -> None:
+    """Save global application settings to disk.
+    
+    Args:
+        settings: ConversationSettings object to save.
+    """
+    path = _get_settings_path()
+    data = _settings_to_dict(settings)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except IOError as e:
+        print(f"Error saving settings: {e}")
 
 
 def _get_storage_path() -> str:
@@ -78,25 +150,40 @@ def load_mcp_server_configs() -> dict[str, dict]:
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            servers = data.get("mcpServers") or data.get("mcp_servers") or {}
+            servers = data.get("mcpServers") or data.get("mcp_servers")
+            # Support files that list server entries at the top-level
+            if not isinstance(servers, dict) and isinstance(data, dict):
+                servers = data
+            if servers is None:
+                servers = {}
             if not isinstance(servers, dict):
                 continue
             for name, meta in servers.items():
                 if not name or not isinstance(meta, dict):
                     continue
                 integration_id = f"mcp/{name}"
+                # Some mcp.json variants wrap actual settings under a `config` key
+                # and may include a human-friendly `name`. Normalize into a flat
+                # `config` dict and a display `name`.
+                if isinstance(meta.get("config"), dict):
+                    cfg = dict(meta.get("config"))
+                else:
+                    cfg = dict(meta)
+
+                display_name = meta.get("name") if isinstance(meta.get("name"), str) else name
+
                 existing = merged.get(integration_id)
                 if not existing:
                     merged[integration_id] = {
                         "id": integration_id,
-                        "name": name,
-                        "config": dict(meta),
+                        "name": display_name,
+                        "config": cfg,
                         "sources": [source],
                     }
                 else:
                     # Later sources override scalar fields, merge dict/list fields.
                     existing_cfg = existing.get("config", {})
-                    _merge_mcp_dict(existing_cfg, meta)
+                    _merge_mcp_dict(existing_cfg, cfg)
                     existing["config"] = existing_cfg
                     sources = existing.get("sources", [])
                     if source not in sources:
@@ -115,6 +202,12 @@ def _iter_mcp_paths() -> list[tuple[str, str]]:
     if os.name == "nt":
         paths.insert(0, ("lmstudio", os.path.join(os.environ.get("USERPROFILE", ""), ".lmstudio", "mcp.json")))
     paths.append(("app", os.path.join(_get_config_dir(), "mcp.json")))
+    # Also include a project-local mcp_servers/mcp.json for development/testing
+    try:
+        repo_path = os.path.join(os.path.dirname(__file__), "mcp_servers", "mcp.json")
+        paths.append(("repo", repo_path))
+    except Exception:
+        pass
     return paths
 
 
