@@ -17,6 +17,7 @@ class MessageBubble(Gtk.Box):
                  on_edit_message: Optional[Callable[[str], None]] = None,
                  on_repush_message: Optional[Callable[[str], None]] = None,
                  on_delete_message: Optional[Callable[[str], None]] = None,
+                 on_message_edited: Optional[Callable[[str, str], None]] = None, # Added this parameter
                  max_content_width: int = -1): # Added max_content_width
         """Initialize the message bubble.
         
@@ -25,13 +26,17 @@ class MessageBubble(Gtk.Box):
             on_edit_message: Callback for editing a message.
             on_repush_message: Callback for re-pushing a message.
             on_delete_message: Callback for deleting a message.
+            on_message_edited: Callback for when the message content is edited.
+            max_content_width: Maximum width for the message content.
         """
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         self.message = message
         self.on_edit_message = on_edit_message
         self.on_repush_message = on_repush_message
         self.on_delete_message = on_delete_message
+        self.on_message_edited = on_message_edited # Store the new callback
         self.max_content_width = max_content_width
+        self.is_editing = False # Track if the message is currently being edited
         # Full width, no alignment tricks
         self.set_halign(Gtk.Align.FILL)
         self.set_hexpand(True)
@@ -101,6 +106,7 @@ class MessageBubble(Gtk.Box):
                 tools_box = self._build_tools_section(tool_events)
                 content_box.pack_start(tools_box, False, False, 0)
         else:
+            # Display mode (Gtk.Label)
             escaped = (
                 message.content.replace("&", "&amp;")
                 .replace("<", "&lt;")
@@ -119,6 +125,43 @@ class MessageBubble(Gtk.Box):
                 # Using a rough estimate of 5 characters per token to convert pixels to chars
                 text_label.set_max_width_chars(int(self.max_content_width / 5))
             content_box.pack_start(text_label, True, True, 0)
+            self.message_display_widget = text_label
+
+            # Edit mode (Gtk.TextView)
+            edit_text_view = Gtk.TextView()
+            edit_text_view.set_wrap_mode(Gtk.WrapMode.WORD)
+            edit_text_view.get_buffer().set_text(message.content, -1)
+            edit_text_view.set_size_request(-1, 100) # Give it some initial height
+            edit_text_view.get_style_context().add_class("message-editor")
+            
+            edit_text_scroll = Gtk.ScrolledWindow()
+            edit_text_scroll.add(edit_text_view)
+            edit_text_scroll.set_hexpand(True)
+            edit_text_scroll.set_vexpand(True)
+            edit_text_scroll.set_size_request(-1, 100)
+            
+            # Action buttons for edit mode
+            edit_actions_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            edit_actions_box.set_halign(Gtk.Align.END)
+            edit_actions_box.get_style_context().add_class("message-editor-actions")
+
+            save_btn = Gtk.Button.new_with_label("Save")
+            save_btn.get_style_context().add_class("suggested-action")
+            save_btn.connect("clicked", self._on_edit_submitted)
+            edit_actions_box.pack_start(save_btn, False, False, 0)
+
+            cancel_btn = Gtk.Button.new_with_label("Cancel")
+            cancel_btn.connect("clicked", self._on_edit_cancelled)
+            edit_actions_box.pack_start(cancel_btn, False, False, 0)
+            
+            self.message_edit_container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            self.message_edit_container.pack_start(edit_text_scroll, True, True, 0)
+            self.message_edit_container.pack_start(edit_actions_box, False, False, 0)
+            self.message_edit_container.show_all()
+            
+            content_box.pack_start(self.message_edit_container, True, True, 0)
+            self.message_edit_container.hide() # Initially hidden
+            self.message_editor_text_view = edit_text_view
         
         # Footer metadata (message context + timestamp)
         footer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
@@ -195,6 +238,46 @@ class MessageBubble(Gtk.Box):
         # Show all children
         self.show_all()
 
+    def set_edit_mode(self, editing: bool) -> None:
+        """Set the message bubble into or out of edit mode."""
+        if self.message.role != MessageRole.USER:
+            return # Only user messages can be edited
+            
+        self.is_editing = editing
+        self.message_display_widget.set_visible(not editing)
+        self.message_edit_container.set_visible(editing)
+        
+        if editing:
+            # Populate the TextView with current content and set focus
+            self.message_editor_text_view.get_buffer().set_text(self.message.content, -1)
+            self.message_editor_text_view.grab_focus()
+            # Hide action buttons when editing
+            self.edit_button.hide()
+            if self.repush_button:
+                self.repush_button.hide()
+            self.delete_button.hide()
+        else:
+            # Show action buttons when not editing
+            self.edit_button.show()
+            if self.repush_button:
+                self.repush_button.show()
+            self.delete_button.show()
+
+    def _on_edit_submitted(self, _button) -> None:
+        """Handle save button click in edit mode."""
+        buffer = self.message_editor_text_view.get_buffer()
+        new_content = buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), False)
+        
+        if self.on_message_edited:
+            self.on_message_edited(self.message.id, new_content)
+        
+        # Exit edit mode regardless of whether callback was handled
+        self.set_edit_mode(False)
+
+    def _on_edit_cancelled(self, _button) -> None:
+        """Handle cancel button click in edit mode."""
+        self.set_edit_mode(False)
+
     def _message_token_count(self, message: Message) -> int:
         """Return stored token count, or a rough estimate when unavailable."""
         if message.tokens and message.tokens > 0:
@@ -245,9 +328,7 @@ class MessageBubble(Gtk.Box):
 
         def toggle(btn):
             revealer.set_reveal_child(not revealer.get_reveal_child())
-            icon_name = (
-                "pan-up-symbolic" if revealer.get_reveal_child() else "pan-down-symbolic"
-            )
+            icon_name = "pan-up-symbolic" if revealer.get_reveal_child() else "pan-down-symbolic"
             expand_btn.set_image(
                 Gtk.Image.new_from_icon_name(icon_name, Gtk.IconSize.BUTTON)
             )
@@ -568,6 +649,7 @@ class MessageBubble(Gtk.Box):
     def _on_edit_clicked(self, _button) -> None:
         if self.on_edit_message:
             self.on_edit_message(self.message.id)
+        self.set_edit_mode(True)
 
     def _on_repush_clicked(self, _button) -> None:
         """Handle repush button click."""

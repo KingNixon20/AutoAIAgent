@@ -44,8 +44,9 @@ logger = logging.getLogger(__name__)
 
 
 class MainWindow(Gtk.ApplicationWindow):
-    def __init__(self, app):
+    def __init__(self, app, asyncio_thread):
         super().__init__(application=app)
+        self.asyncio_thread = asyncio_thread # Store the asyncio thread
         self.set_title("AutoAI - Local AI Chat")
         screen = Gdk.Screen.get_default()
         # Prefer the monitor workarea (usable desktop) when available so default
@@ -170,6 +171,7 @@ class MainWindow(Gtk.ApplicationWindow):
             on_edit_message_request=self._on_edit_message,
             on_repush_message_request=self._on_repush_message,
             on_delete_message_request=self._on_delete_message,
+            on_message_edited_request=self._on_message_edited,
         )
         self.chat_area.on_chat_settings_changed = self._on_chat_settings_changed
         center_box.pack_start(self.chat_area, True, True, 0)
@@ -667,6 +669,93 @@ class MainWindow(Gtk.ApplicationWindow):
             lambda: asyncio.ensure_future(self._check_api_connection_and_update_status()),
             priority=GLib.PRIORITY_DEFAULT,
         )
+    
+    def _on_edit_message(self, message_id: str) -> None:
+        """Handle request to edit a message (from MessageBubble)."""
+        if self.current_conversation:
+            self.chat_area.edit_message_bubble(message_id)
+
+    def _on_repush_message(self, message_id: str) -> None:
+        """Handle request to re-push a message (from MessageBubble)."""
+        # Logic to re-push a message. This is similar to editing then regenerating,
+        # but without content change. For now, we'll implement it as regenerating
+        # from the specified message.
+        if self.current_conversation:
+            self._regenerate_response_from_message(message_id)
+
+    def _on_delete_message(self, message_id: str) -> None:
+        """Handle request to delete a message (from MessageBubble)."""
+        if not self.current_conversation:
+            return
+        
+        message_index_to_delete = -1
+        for i, msg in enumerate(self.current_conversation.messages):
+            if msg.id == message_id:
+                message_index_to_delete = i
+                break
+        
+        if message_index_to_delete == -1:
+            return
+        
+        # Remove the message and all subsequent messages
+        self.current_conversation.messages = self.current_conversation.messages[:message_index_to_delete]
+        self._save_conversations()
+        
+        # Reload the conversation to update the UI
+        self._load_conversation(self.current_conversation.id)
+        
+        # Optionally, regenerate response if the deleted message was the last user message
+        if message_index_to_delete > 0:
+            last_msg = self.current_conversation.messages[-1]
+            if last_msg.role == MessageRole.USER:
+                self._regenerate_response_from_message(last_msg.id)
+
+    def _on_message_edited(self, message_id: str, new_content: str) -> None:
+        """Handles a message being edited in the UI."""
+        logger.debug("Message %s edited to: %s", message_id, new_content)
+        if self.current_conversation:
+            # The chat_area already updated the message content in the conversation
+            # and removed subsequent messages.
+            # Now, trigger AI response from this message onwards.
+            self._regenerate_response_from_message(message_id)
+
+    def _regenerate_response_from_message(self, message_id: str) -> None:
+        """Regenerates AI response starting from the message with message_id."""
+        if not self.current_conversation:
+            return
+
+        # Find the message index
+        message_index = -1
+        for i, msg in enumerate(self.current_conversation.messages):
+            if msg.id == message_id:
+                message_index = i
+                break
+
+        if message_index == -1:
+            logger.warning("Attempted to regenerate from unknown message ID: %s", message_id)
+            return
+        
+        # Ensure only messages up to the edited one are kept in the conversation
+        self.current_conversation.messages = self.current_conversation.messages[:message_index + 1]
+
+        # Hide typing indicator (if shown) and show it again for new response
+        self.chat_area.hide_typing_indicator()
+        self.chat_area.show_typing_indicator()
+
+        # Save conversation state
+        self._save_conversations()
+
+        # Trigger AI response from this point
+        settings = self._get_effective_settings(self.current_conversation)
+        conv = self.current_conversation
+        conv_id = conv.id
+        mode = conv.chat_mode
+
+        threading.Thread(
+            target=self._fetch_ai_response,
+            args=(conv.messages[-1].content, conv, conv_id, settings, mode),
+            daemon=True,
+        ).start()
 
     def _on_send_message(self, button) -> None:
         """Handle message sending.
@@ -795,26 +884,28 @@ class MainWindow(Gtk.ApplicationWindow):
             self._set_agent_running(conversation_id, True)
             self._clear_agent_stop_request(conversation_id)
             try:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                try:
-                    logger.debug("_fetch_ai_response: Starting agent mode sequence.")
-                    loop.run_until_complete(
+                global asyncio_thread # Access the global asyncio thread
+                if asyncio_thread.loop and asyncio_thread.loop.is_running():
+                    logger.debug("_fetch_ai_response: Submitting agent mode sequence to asyncio_thread.")
+                    future = asyncio.run_coroutine_threadsafe(
                         self._run_agent_mode_sequence(
                             conversation=conversation,
                             conversation_id=conversation_id,
                             settings=settings,
                             user_text=user_text,
-                        )
+                        ),
+                        asyncio_thread.loop
                     )
-                    logger.debug("_fetch_ai_response: Agent mode sequence completed.")
-                finally:
-                    loop.close()
+                    future.result() # Blocks until completion
+                    logger.debug("_fetch_ai_response: Agent mode sequence completed in asyncio_thread.")
+                else:
+                    logger.error("Asyncio loop not running in separate thread for agent mode.")
+                    raise ConnectionError("Asyncio event loop is not running. Cannot run agent mode.")
             except Exception as e:
-                logger.warning("_fetch_ai_response: Agent mode run failed: %s", e)
+                logger.warning("_fetch_ai_response: Agent mode run failed (%s): %s", type(e).__name__, e)
                 GLib.idle_add(
                     self._add_assistant_message_and_save,
-                    "Agent mode encountered an error and stopped. Check logs and task list, then retry.",
+                    f"Agent mode encountered an error and stopped: {type(e).__name__} - {e}. Check logs and task list, then retry.",
                     conversation_id,
                     [],
                     None,
@@ -835,8 +926,7 @@ class MainWindow(Gtk.ApplicationWindow):
         followup_message = ""
         followup_tasks: list[dict] = []
         try:
-            global asyncio_thread # Access the global asyncio thread
-            if asyncio_thread.loop and asyncio_thread.loop.is_running():
+            if self.asyncio_thread.loop and self.asyncio_thread.loop.is_running():
                 logger.debug("_fetch_ai_response: Submitting _get_api_response to asyncio_thread.")
                 
                 # Submit _get_api_response to the asyncio thread and wait for its result.
@@ -844,7 +934,7 @@ class MainWindow(Gtk.ApplicationWindow):
                 # .result() blocks until the coroutine completes or raises an exception.
                 future = asyncio.run_coroutine_threadsafe(
                     self._get_api_response(conversation, settings, mode=mode),
-                    asyncio_thread.loop
+                    self.asyncio_thread.loop
                 )
                 response_text, tool_events, planned_tasks = future.result() # This will block until result is ready
                 
@@ -859,7 +949,7 @@ class MainWindow(Gtk.ApplicationWindow):
                             plan_response=response_text,
                             planned_tasks=planned_tasks,
                         ),
-                        asyncio_thread.loop
+                        self.asyncio_thread.loop
                     )
                     followup_message, followup_tasks = plan_review_future.result()
                     logger.debug("_fetch_ai_response: _plan_mode_review_for_missing_info returned.")

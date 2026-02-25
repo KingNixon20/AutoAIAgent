@@ -173,7 +173,7 @@ class LMStudioClient:
             full_history = conversation.get_context_window(max_tokens=None)
             fallback_history = conversation.get_context_window(max_tokens=settings.context_limit)
             messages = await self._build_token_saver_messages(
-                session=session,
+                session=self.session, # Use self.session
                 conversation=conversation,
                 settings=settings,
                 full_history=full_history,
@@ -221,7 +221,7 @@ class LMStudioClient:
         try:
             for round_idx in range(max_tool_rounds):
                 response = await self._chat_completion_once(
-                    session=session,
+                    session=self.session, # Use self.session
                     model=conversation.model,
                     messages=messages,
                     settings_payload=settings_payload,
@@ -307,24 +307,24 @@ class LMStudioClient:
 
             raise LMStudioError("Exceeded tool-call round limit without final response")
         except asyncio.TimeoutError as e:
-            await session.close()
+            if self.session and not self.session.closed: await self.session.close()
             raise LMStudioError(f"API request timed out (exceeded {C.API_TIMEOUT}s)")
         except aiohttp.ClientConnectorError as e:
-            await session.close()
+            if self.session and not self.session.closed: await self.session.close()
             raise LMStudioError(f"Failed to connect to LM Studio: {e}")
         except aiohttp.ClientSSLError as e:
-            await session.close()
+            if self.session and not self.session.closed: await self.session.close()
             raise LMStudioError(f"SSL error connecting to LM Studio: {e}")
         except aiohttp.ClientError as e:
-            await session.close()
+            if self.session and not self.session.closed: await self.session.close()
             raise LMStudioError(f"Client error: {e}")
         except Exception as e:
-            await session.close()
+            if self.session and not self.session.closed: await self.session.close()
             logger.error(f"Chat completion error: {e}")
             raise LMStudioError(f"Unexpected error: {e}")
         finally:
-            if not session.closed:
-                await session.close()
+            if self.session and not self.session.closed:
+                await self.session.close()
 
     async def count_tokens(self, text: str, model: Optional[str] = None) -> int:
         """Count tokens using the configured tokenizer.

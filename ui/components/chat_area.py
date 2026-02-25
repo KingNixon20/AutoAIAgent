@@ -18,7 +18,8 @@ class ChatArea(Gtk.Box):
     def __init__(self,
                  on_edit_message_request: Optional[Callable[[str], None]] = None,
                  on_repush_message_request: Optional[Callable[[str], None]] = None,
-                 on_delete_message_request: Optional[Callable[[str], None]] = None):
+                 on_delete_message_request: Optional[Callable[[str], None]] = None,
+                 on_message_edited_request: Optional[Callable[[str, str], None]] = None): # New callback
         """Initialize the chat area."""
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=0)
 
@@ -36,6 +37,8 @@ class ChatArea(Gtk.Box):
         self.on_edit_message_request = on_edit_message_request
         self.on_repush_message_request = on_repush_message_request
         self.on_delete_message_request = on_delete_message_request
+        self.on_message_edited_request = on_message_edited_request # Store the new callback
+        self._on_message_edited_internal = self._handle_message_edited # Internal handler
 
         # Chat header
         self.header_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
@@ -101,6 +104,90 @@ class ChatArea(Gtk.Box):
 
         self.scrolled = scrolled
         self.messages_box.connect("size-allocate", self._on_messages_size_allocate)
+
+    def get_message_bubble_by_id(self, message_id: str) -> Optional[MessageBubble]:
+        """Finds and returns a MessageBubble widget by its associated message ID."""
+        for child in self.messages_box.get_children():
+            if isinstance(child, MessageBubble) and child.message.id == message_id:
+                return child
+        return None
+
+    def edit_message_bubble(self, message_id: str) -> None:
+        """Puts a specific message bubble into edit mode."""
+        bubble = self.get_message_bubble_by_id(message_id)
+        if bubble and bubble.message.role == MessageRole.USER:
+            bubble.set_edit_mode(True)
+            self._autoscroll_enabled = False # Disable autoscroll while editing
+
+    def _handle_message_edited(self, message_id: str, new_content: str) -> None:
+        """Handles the event when a message bubble's content has been edited."""
+        if not self._current_conversation:
+            return
+
+        edited_message_index = -1
+        for i, message in enumerate(self._current_conversation.messages):
+            if message.id == message_id:
+                edited_message_index = i
+                break
+
+        if edited_message_index == -1:
+            print(f"Error: Message with ID {message_id} not found for editing.")
+            return
+
+        # 1. Update the message content in the conversation object
+        self._current_conversation.messages[edited_message_index].content = new_content
+        self._current_conversation.messages[edited_message_index].timestamp = datetime.now() # Update timestamp
+
+        # 2. Remove all subsequent messages from the conversation object
+        self._current_conversation.messages = self._current_conversation.messages[:edited_message_index + 1]
+
+        # 3. Remove all subsequent MessageBubble widgets from the display
+        children_to_remove = []
+        for i, child in enumerate(self.messages_box.get_children()):
+            if isinstance(child, MessageBubble) and child.message.id == message_id:
+                # All children after this one (and potentially including date separators)
+                children_to_remove = self.messages_box.get_children()[i+1:]
+                break
+        
+        for child in children_to_remove:
+            self.messages_box.remove(child)
+        
+        # 4. Re-enable autoscroll
+        self._autoscroll_enabled = True
+
+        # 5. Trigger the re-iteration (callback to main window)
+        if self.on_message_edited_request:
+            self.on_message_edited_request(message_id, new_content)
+        
+        # Re-display the updated message bubble to reflect new content (and potentially new token count)
+        # We need to find the bubble again as the children list might have changed
+        updated_bubble = self.get_message_bubble_by_id(message_id)
+        if updated_bubble:
+            # For user messages, the content is rendered as a Gtk.Label inside the bubble
+            # We need to update this label
+            if updated_bubble.message.role == MessageRole.USER and hasattr(updated_bubble, 'message_display_widget'):
+                escaped = (
+                    new_content.replace("&", "&amp;")
+                    .replace("<", "&lt;")
+                    .replace(">", "&gt;")
+                )
+                updated_bubble.message_display_widget.set_markup(f"<span size='11000'>{escaped}</span>")
+            # Update token count
+            for child in updated_bubble.get_children():
+                if isinstance(child, Gtk.Box) and child.get_style_context().has_class("message-actions"):
+                    # Assuming token label is part of the footer, which is packed before action buttons
+                    # This is a bit brittle, might need a more robust way to find the token label
+                    footer_children = child.get_parent().get_children()
+                    for f_child in footer_children:
+                        if isinstance(f_child, Gtk.Label) and "token(s)" in f_child.get_text():
+                            f_child.set_markup(f"<span size='8200' foreground='#9a9a9a'>{updated_bubble._message_token_count(updated_bubble.message):,} token(s)</span>")
+                            break
+            updated_bubble.message.content = new_content # Ensure message object is updated
+            updated_bubble.show_all()
+        
+        self._update_subtitle() # Update context token count in subtitle
+        self._request_scroll_to_bottom(8)
+
 
     def set_global_settings_provider(self, provider) -> None:
         """Set callable returning current global settings."""
@@ -182,6 +269,7 @@ class ChatArea(Gtk.Box):
             on_edit_message=self.on_edit_message_request,
             on_repush_message=self.on_repush_message_request,
             on_delete_message=self.on_delete_message_request,
+            on_message_edited=self.on_message_edited_request, # Pass the new callback
             max_content_width=calculated_width,
         )
         self.messages_box.add(bubble)

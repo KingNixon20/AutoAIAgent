@@ -540,3 +540,23 @@ button.send-button-small {
   background-color: rgba(128, 128, 128, 0.1);
   color: @text-secondary;
 }
+
+/* Message Editor */
+.message-editor {
+  background-color: @bg-secondary;
+  border: 1px solid @border-color;
+  border-radius: 6px;
+  padding: 8px;
+  min-height: 80px; /* Provide a minimum height */
+}
+
+.message-editor:focus-within {
+  border-color: @primary-accent;
+  box-shadow: 0 0 8px rgba(0, 217, 255, 0.3);
+}
+
+.message-editor-actions {
+  margin-top: 8px;
+  padding-top: 4px;
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+}
