@@ -56,7 +56,8 @@ def generate_project_map(root_dir='.'):
             })
 
     # Write to project_map.json
-    with open('project_map.json', 'w') as f:
+    map_file_path = Path(root_dir) / 'project_map.json'
+    with open(map_file_path, 'w') as f:
         json.dump(map_data, f, indent=2)
 
 if __name__ == '__main__':

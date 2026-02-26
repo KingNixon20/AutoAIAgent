@@ -1,1 +1,18 @@
-[]
+[
+  {
+    "path": "PROJECT_CONSTITUTION.md",
+    "summary": "# Project Constitution\n## Vision\nThe primary goal of this project is to...",
+    "symbols": [
+      {
+        "name": "names",
+        "type": "function",
+        "line": 459
+      }
+    ]
+  },
+  {
+    "path": "PROJECT_INDEX.json",
+    "summary": "{}",
+    "symbols": []
+  }
+]

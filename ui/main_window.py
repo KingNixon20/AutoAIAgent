@@ -25,6 +25,7 @@ from storage import (
 )
 from api import LMStudioClient
 from models import Message, MessageRole, Conversation, ConversationSettings
+from copy import deepcopy
 from gi.repository import Gtk, Gio, GLib, Gdk
 import logging
 import threading
@@ -1329,6 +1330,70 @@ class MainWindow(Gtk.ApplicationWindow):
                     GLib.idle_add(self.chat_input.set_model_status, False, "Disconnected", priority=GLib.PRIORITY_DEFAULT)
                     raise
 
+    def _normalize_tool_path_args_for_display_and_execution(self, tool_name: str, args: dict) -> tuple[dict, dict]:
+        """
+        Normalizes path arguments for file-related tool calls.
+        Returns two dictionaries:
+        1. `display_args`: arguments with paths resolved to absolute for UI display.
+        2. `exec_args`: arguments with paths resolved to safe relative for tool execution.
+        """
+        # A map of tool names to the key of their path argument.
+        # Handles single paths and lists of paths.
+        PATH_ARG_MAP = {
+            "builtin_read_file": "path",
+            "builtin_write_file": "path",
+            "builtin_edit_file": "path",
+            "builtin_delete_file": "path",
+            "list_files": "path", # from _tool_list_files
+            "read_file": "path",  # from _tool_read_file
+            "search_text": "path", # from _tool_search_text
+            "summarize_file_for_index": "path",
+            "load_files_into_context": "paths", # This one is a list
+            "update_project_index": "file_path",
+        }
+
+        exec_args = deepcopy(args) # Use deepcopy to avoid modifying original dict too early
+        display_args = deepcopy(args)
+
+        path_arg_key = PATH_ARG_MAP.get(tool_name)
+        if not path_arg_key or path_arg_key not in args:
+            return display_args, exec_args
+
+        workspace_root = self._get_workspace_root()
+        real_workspace_root = os.path.realpath(workspace_root)
+
+        def normalize_for_display(p: str) -> str:
+            if not isinstance(p, str) or not p.strip():
+                return p
+            p = p.strip()
+            intended_abs_path = os.path.abspath(os.path.join(workspace_root, p))
+            real_abs_path = os.path.realpath(intended_abs_path)
+            if real_abs_path.startswith(real_workspace_root):
+                return real_abs_path
+            return f"[UNSAFE PATH: {p}]"
+
+        def normalize_for_execution(p: str) -> str:
+            if not isinstance(p, str) or not p.strip():
+                return p
+            p = p.strip()
+            if os.path.isabs(p):
+                intended_abs_path = os.path.abspath(os.path.join(workspace_root, p))
+                real_abs_path = os.path.realpath(intended_abs_path)
+                if real_abs_path.startswith(real_workspace_root):
+                    return os.path.relpath(real_abs_path, real_workspace_root)
+            return p # If relative, or unsafe absolute, pass as-is for _safe_path to handle
+
+        if path_arg_key == "paths": # Handle list of paths
+            if isinstance(args.get(path_arg_key), list):
+                display_args[path_arg_key] = [normalize_for_display(path) for path in args[path_arg_key]]
+                exec_args[path_arg_key] = [normalize_for_execution(path) for path in args[path_arg_key]]
+        else: # Handle single path
+            if path_arg_key in args:
+                display_args[path_arg_key] = normalize_for_display(args[path_arg_key])
+                exec_args[path_arg_key] = normalize_for_execution(args[path_arg_key])
+        
+        return display_args, exec_args
+
     async def _execute_tool_call_with_approval(
         self,
         tool_name: str,
@@ -1339,9 +1404,14 @@ class MainWindow(Gtk.ApplicationWindow):
         on_tool_event: Optional[Callable[[dict], None]] = None, # Added on_tool_event
     ) -> str:
         """Prompt user for tool permission before execution unless auto-approved."""
+        # Normalize path arguments for display in the approval dialog
+        # and for safe execution later.
+        display_args, exec_args = self._normalize_tool_path_args_for_display_and_execution(tool_name, args)
+
         if not settings.auto_tool_approval:
+            # Pass the display_args to the approval blocking dialog
             approved, enable_auto, denial_reason = await asyncio.to_thread(
-                self._request_tool_permission_blocking, tool_name, args
+                self._request_tool_permission_blocking, tool_name, display_args
             )
             if enable_auto:
                 settings.auto_tool_approval = True
@@ -1355,7 +1425,7 @@ class MainWindow(Gtk.ApplicationWindow):
                 
                 tool_event = {
                     "name": tool_name,
-                    "args": args,
+                    "args": display_args, # Use display_args for logging/feedback to show what user saw
                     "status": "error",
                     "result": {"ok": False, "error": error_message},
                     "details": {"type": "tool_error", "message": error_message}
@@ -1372,7 +1442,7 @@ class MainWindow(Gtk.ApplicationWindow):
         
         json_result, tool_event = await self._execute_tool_call(
             tool_name,
-            args,
+            exec_args, # Use exec_args here for actual execution
             mcp_tool_map=mcp_tool_map,
             server_configs=server_configs,
         )
