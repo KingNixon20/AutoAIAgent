@@ -5,7 +5,7 @@
       "command": "python",
       "args": ["mcp_servers/web_search.py"],
       "env": {
-        "SERPAPI_KEY": "dde288f1de31ac91fd1d86b82cb132b2b86afc3df7a5e576cc11e6c05043dbc8"
+        "SERPAPI_KEY": "SERP-API-KEY-GOES-HERE"
       }
     }
   }
