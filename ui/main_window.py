@@ -2173,6 +2173,7 @@ class MainWindow(Gtk.ApplicationWindow):
         """Asynchronous cleanup tasks for MainWindow destruction."""
         logger.debug("Running async cleanup for MainWindow.")
         storage.save_settings(self.settings)
+        self._save_conversations() # Ensure conversations are saved on shutdown
         await self.api_client.close()
         if hasattr(self.asyncio_thread, 'stop'):
             self.asyncio_thread.stop()
