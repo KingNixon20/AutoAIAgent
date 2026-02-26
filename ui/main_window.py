@@ -40,6 +40,7 @@ import difflib # Added for diff generation
 from datetime import datetime
 from token_counter import count_text_tokens
 from project_map import refresh_project_map
+import fnmatch # Added for project map generation
 import gi
 
 gi.require_version("Gtk", "3.0")
@@ -138,7 +139,9 @@ class MainWindow(Gtk.ApplicationWindow):
         )
 
         # API client
-        self.api_client = LMStudioClient()
+        self.api_client = LMStudioClient(
+            on_auto_tool_approval_changed=self._on_auto_tool_approval_changed
+        )
         self._loop = None
         self.mcp_discovery = MCPToolDiscovery()
 
@@ -657,6 +660,7 @@ class MainWindow(Gtk.ApplicationWindow):
             "context_limit",
             "token_saver",
             "system_prompt",
+            "auto_tool_approval",
         ):
             if key in chat_settings:
                 overrides[key] = chat_settings[key]
@@ -770,10 +774,19 @@ class MainWindow(Gtk.ApplicationWindow):
 
     def _on_refresh_connection(self, _button) -> None:
         """Handle refresh button click in chat input to re-check API connection."""
-        GLib.idle_add(
-            lambda: asyncio.ensure_future(self._check_api_connection_and_update_status()),
-            priority=GLib.PRIORITY_DEFAULT,
-        )
+        if getattr(self, "asyncio_thread", None) and getattr(self.asyncio_thread, "loop", None) and self.asyncio_thread.loop.is_running():
+            asyncio.run_coroutine_threadsafe(
+                self._check_api_connection_and_update_status(),
+                self.asyncio_thread.loop
+            )
+        else:
+            logger.error("Asyncio loop not running for refresh connection. Cannot check API.")
+            GLib.idle_add(
+                self.chat_input.set_model_status,
+                False,
+                "Disconnected",
+                priority=GLib.PRIORITY_DEFAULT,
+            )
     
     def _on_edit_message(self, message_id: str) -> None:
         """Handle request to edit a message (from MessageBubble)."""
@@ -1057,6 +1070,7 @@ class MainWindow(Gtk.ApplicationWindow):
                             settings=settings,
                             plan_response=response_text,
                             planned_tasks=planned_tasks,
+                            existing_tasks=conversation.ai_tasks, # Pass existing tasks
                         ),
                         self.asyncio_thread.loop
                     )
@@ -1354,14 +1368,14 @@ class MainWindow(Gtk.ApplicationWindow):
             on_tool_event(tool_event)
         return json_result
 
-    def _request_tool_permission_blocking(self, tool_name: str, args: dict) -> tuple[bool, bool]:
+    def _request_tool_permission_blocking(self, tool_name: str, args: dict) -> tuple[bool, bool, Optional[str]]:
         """Show a blocking permission dialog on the GTK thread.
 
         Returns:
-            (approved, enable_auto_approval)
+            (approved, enable_auto, denial_reason)
         """
         done = threading.Event()
-        result = {"approved": False, "enable_auto": False}
+        result = {"approved": False, "enable_auto": False, "reason": None} # Initialize with reason
 
         def _show_dialog() -> bool:
             dialog = Gtk.Dialog(
@@ -1373,6 +1387,42 @@ class MainWindow(Gtk.ApplicationWindow):
             dialog.add_button("Deny", Gtk.ResponseType.CANCEL)
             dialog.add_button("Approve", Gtk.ResponseType.OK)
             dialog.add_button("Approve + Auto", Gtk.ResponseType.APPLY)
+
+            def on_deny_with_reason(btn):
+                """Show a transient dialog to collect the reason, then close main dialog."""
+                reason_dialog = Gtk.Dialog(
+                    title="Reason for Denial",
+                    transient_for=dialog,
+                    flags=0,
+                )
+                reason_dialog.add_buttons(
+                    "Cancel", Gtk.ResponseType.CANCEL,
+                    "Submit", Gtk.ResponseType.OK,
+                )
+                reason_dialog.set_default_size(400, 150)
+
+                # Add an entry field
+                entry = Gtk.Entry()
+                entry.set_activates_default(True)
+                reason_dialog.get_content_area().pack_start(entry, False, False, 0)
+                reason_dialog.show_all()
+
+                resp = reason_dialog.run()
+                reason_text = entry.get_text().strip() if resp == Gtk.ResponseType.OK else ""
+                reason_dialog.destroy()
+
+                if resp == Gtk.ResponseType.OK and reason_text:
+                    # Store the reason
+                    result["reason"] = reason_text
+
+                    # Close the main dialog with REJECT to indicate denial with reason
+                    dialog.response(Gtk.ResponseType.REJECT)
+                # If cancelled, do nothing – user stays in the main dialog
+
+            deny_with_reason_btn = Gtk.Button(label="Deny with Reason")
+            deny_with_reason_btn.connect("clicked", on_deny_with_reason)
+            dialog.add_action_widget(deny_with_reason_btn, Gtk.ResponseType.REJECT) # Use REJECT response for deny_with_reason
+
             dialog.set_default_response(Gtk.ResponseType.OK)
             dialog.set_default_size(620, 360)
 
@@ -1419,12 +1469,14 @@ class MainWindow(Gtk.ApplicationWindow):
             elif response == Gtk.ResponseType.APPLY:
                 result["approved"] = True
                 result["enable_auto"] = True
+            elif response == Gtk.ResponseType.REJECT: # Handle explicit REJECT from deny_with_reason
+                result["approved"] = False
             done.set()
             return False
 
         GLib.idle_add(_show_dialog)
         done.wait(timeout=600.0)
-        return (bool(result["approved"]), bool(result["enable_auto"]))
+        return (bool(result["approved"]), bool(result["enable_auto"]), result["reason"])
 
     def _add_assistant_message_and_save(
         self,
@@ -1553,6 +1605,11 @@ class MainWindow(Gtk.ApplicationWindow):
 
             # --- Prepare Global Context ---
             global_context = ""
+            # Generate and add simple project map
+            project_map = self._generate_simple_project_map(project_dir)
+            logger.debug("--- Simple Project Map for %s ---\n%s\n-------------------------------------", project_dir, project_map)
+            global_context += f"CURRENT PROJECT FILE STRUCTURE:\n```\n{project_map}\n```\n\n"
+
             if project_constitution:
                 global_context += f"PROJECT CONSTITUTION:\n{project_constitution}\n\n"
             if project_index_data:
@@ -1664,6 +1721,7 @@ class MainWindow(Gtk.ApplicationWindow):
             implementation_attempts = 0
             max_implementation_attempts = 3
             compile_ok = False
+            last_compile_detail = "" # Initialized here
             
             while implementation_attempts < max_implementation_attempts:
                 implementation_attempts += 1
@@ -1675,11 +1733,21 @@ class MainWindow(Gtk.ApplicationWindow):
                     priority=GLib.PRIORITY_DEFAULT,
                 )
 
-                implementation_instruction = (
+                # Dynamically adjust instruction based on previous compilation failure
+                current_instruction = (
                     f"{global_context}"
                     f"Execute exactly this one task now: {task_text}\n"
                     "Use tools if needed. After finishing, summarize what changed."
                 )
+                if implementation_attempts > 1 and last_compile_detail: # Check if it's a retry and there was a previous error
+                    current_instruction = (
+                        f"{global_context}"
+                        f"The previous attempt to complete the task '{task_text}' resulted in compilation errors.\n"
+                        f"Here is the compilation output:\n```\n{last_compile_detail}\n```\n"
+                        f"Please fix the issues and re-attempt the task. Focus only on resolving these compilation errors first. "
+                        f"After fixing, summarize what changed and confirm compilation success."
+                    )
+                
                 temp_conv = Conversation(
                     id=conv_live.id,
                     title=conv_live.title,
@@ -1698,7 +1766,7 @@ class MainWindow(Gtk.ApplicationWindow):
                     Message(
                         id=str(uuid.uuid4()),
                         role=MessageRole.USER,
-                        content=implementation_instruction,
+                        content=current_instruction, # Use the dynamically adjusted instruction
                     )
                 )
 
@@ -1738,18 +1806,17 @@ class MainWindow(Gtk.ApplicationWindow):
 
                 compile_ok, compile_detail = await self._run_compile_check(project_dir)
                 if not compile_ok:
+                    last_compile_detail = compile_detail # Store the detail for the next iteration
                     GLib.idle_add(
                         self._add_agent_progress_message,
                         conversation_id,
                         f"Compile check failed. Output:\n{compile_detail}",
                         priority=GLib.PRIORITY_DEFAULT,
                     )
-                    # Add the compilation error to the conversation history
-                    # so the AI can see it in the next attempt
                     conv_live.add_message(
                         Message(
                             id=str(uuid.uuid4()),
-                            role=MessageRole.ASSISTANT,
+                            role=MessageRole.SYSTEM,
                             content=f"Compilation failed with the following output:\n{compile_detail}",
                         )
                     )
@@ -1990,6 +2057,55 @@ class MainWindow(Gtk.ApplicationWindow):
         
         return "No specific details available."
 
+    def _on_destroy(self, _widget) -> None:
+        """Called when the main window is destroyed."""
+        logger.debug("MainWindow destroyed. Initiating cleanup.")
+        # Schedule the async cleanup on the asyncio thread's loop
+        if getattr(self, "asyncio_thread", None) and getattr(self.asyncio_thread, "loop", None) and self.asyncio_thread.loop.is_running():
+            asyncio.run_coroutine_threadsafe(
+                self._async_on_destroy(),
+                self.asyncio_thread.loop
+            )
+        else:
+            # Fallback for when asyncio loop is not running (e.g., during testing or unexpected shutdown)
+            # This is less ideal as it might block the GTK thread if it takes time.
+            # A more robust solution might involve a separate GLib-based task executor.
+            GLib.idle_add(lambda: asyncio.create_task(self._async_on_destroy_fallback()))
+            
+    async def _async_on_destroy(self) -> None:
+        """Asynchronous cleanup tasks for MainWindow destruction."""
+        logger.debug("Running async cleanup for MainWindow.")
+        storage.save_settings(self.settings)
+        await self.api_client.close()
+        if hasattr(self.asyncio_thread, 'stop'):
+            self.asyncio_thread.stop()
+        logger.debug("Async cleanup complete.")
+
+    async def _async_on_destroy_fallback(self) -> None:
+        """Fallback async cleanup when main asyncio loop is not available."""
+        logger.warning("Asyncio loop not active during MainWindow destroy. Performing fallback cleanup.")
+        storage.save_settings(self.settings)
+        # Attempt to close API client, but it might fail if session is already gone
+        try:
+            await self.api_client.close()
+        except Exception as e:
+            logger.warning("Error closing API client during fallback destroy: %s", e)
+        if hasattr(self.asyncio_thread, 'stop'):
+            self.asyncio_thread.stop()
+        logger.debug("Fallback async cleanup complete.")
+
+    def _on_auto_tool_approval_changed(self, enabled: bool) -> None:
+        """Callback from API client to update global auto-tool approval setting."""
+        self.settings.auto_tool_approval = enabled
+        storage.save_settings(self.settings)
+        logger.debug("Auto-tool approval setting updated to: %s and saved.", enabled)
+
+    def _on_auto_tool_approval_changed(self, enabled: bool) -> None:
+        """Callback from API client to update global auto-tool approval setting."""
+        self.settings.auto_tool_approval = enabled
+        storage.save_settings(self.settings)
+        logger.debug("Auto-tool approval setting updated to: %s and saved.", enabled)
+
     def _add_agent_progress_message(
             self, conversation_id: str, text: str) -> bool:
         """Add a progress message for agent workflow."""
@@ -2103,6 +2219,7 @@ class MainWindow(Gtk.ApplicationWindow):
         """Build an augmented system prompt according to selected mode."""
         base = (base_prompt or "You are a helpful AI assistant.").strip()
         if mode == "plan":
+            task_context = self._render_ordered_tasks(tasks)
             return (
                 f"{base}\n\n"
                 "You are in planning mode.\n"
@@ -2112,6 +2229,9 @@ class MainWindow(Gtk.ApplicationWindow):
                 "Each step must describe a concrete action (for example: create file X, "
                 "implement function Y, test Z).\n"
                 "Transform the user's request into an implementation plan with concrete steps.\n"
+                "Current Plan:\n"
+                f"{task_context}\n\n"
+                "If the current plan is empty, generate a new plan. Otherwise, refine the existing plan or add new steps to achieve the user's request.\n"
                 "Return ONLY valid JSON (no markdown, no prose) with this exact schema:\n"
                 "{\n"
                 '  "steps": [\n'
@@ -2145,7 +2265,7 @@ class MainWindow(Gtk.ApplicationWindow):
                 "Use available tools whenever they help you inspect files, edit code, run checks, or verify results.\n"
                 "When you use a tool, interpret the result and continue toward task completion.\n"
                 "Do not ask for unnecessary confirmation; proceed unless blocked by missing required information.\n"
-                "IMPORTANT: You are sandboxed to the project directory. All file system operations MUST be relative to the project directory. Any attempt to access files or directories outside of the project directory will be denied.\n"
+                "IMPORTANT: You are sandboxed to the project directory. All file system operations MUST be relative to the project directory, always provide full paths. Any attempt to access files or directories outside of the project directory will be denied.\n"
                 "After each task, provide a concise progress update and what changed.\n"
                 "Saved tasks:\n"
                 f"{task_context}\n"
@@ -2262,14 +2382,17 @@ class MainWindow(Gtk.ApplicationWindow):
         settings: ConversationSettings,
         plan_response: str,
         planned_tasks: list[dict],
+        existing_tasks: list[dict], # New parameter
     ) -> tuple[str, list[dict]]:
         """Ask a second background question in plan mode to detect missing user info."""
         try:
             ordered_tasks_text = self._render_ordered_tasks(planned_tasks)
+            existing_tasks_text = self._render_ordered_tasks(existing_tasks) # Render existing tasks
             review_prompt = (
                 "Review this newly created plan and determine if any additional information "
                 "is required from the user before implementation can proceed.\n\n"
-                f"Plan tasks (in order):\n{ordered_tasks_text}\n\n"
+                f"Existing Conversation Tasks:\n{existing_tasks_text}\n\n" # Add existing tasks
+                f"Newly Generated Plan tasks (in order):\n{ordered_tasks_text}\n\n"
                 "Return ONLY valid JSON with this schema:\n"
                 "{"
                 '"needs_info": boolean, '
@@ -2430,15 +2553,76 @@ class MainWindow(Gtk.ApplicationWindow):
             )
         return cleaned[:24]
 
+    def _initialize_agent_memory_files(self, project_dir: str) -> None:
+        """Initialize PROJECT_CONSTITUTION.md and PROJECT_INDEX.json in a new agent project directory."""
+        constitution_path = os.path.join(project_dir, "PROJECT_CONSTITUTION.md")
+        index_path = os.path.join(project_dir, "PROJECT_INDEX.json")
+
+        # Initialize PROJECT_CONSTITUTION.md if it doesn't exist
+        if not os.path.exists(constitution_path):
+            default_constitution_content = (
+                "# Project Constitution\n\n"
+                "## Vision\n"
+                "The primary goal of this project is to...\n\n"
+                "## Principles\n"
+                "- Modularity: Code should be organized into small, reusable components.\n"
+                "- Readability: Code should be easy to understand and maintain.\n"
+                "- Testability: Components should be easily testable.\n\n"
+                "## Technology Stack\n"
+                "- Primary Language: Python\n"
+                "- UI Framework: GTK3 (PyGObject)\n\n"
+                "## Conventions\n"
+                "- Follow PEP 8 for Python styling.\n"
+                "- Use clear, descriptive variable and function names.\n"
+                "- Keep functions small and focused on a single responsibility.\n"
+            )
+            try:
+                with open(constitution_path, "w", encoding="utf-8") as f:
+                    f.write(default_constitution_content)
+                logger.info("Initialized PROJECT_CONSTITUTION.md in %s", project_dir)
+            except Exception as e:
+                logger.error("Failed to initialize PROJECT_CONSTITUTION.md: %s", e)
+        
+        # Initialize PROJECT_INDEX.json if it doesn't exist
+        if not os.path.exists(index_path):
+            try:
+                with open(index_path, "w", encoding="utf-8") as f:
+                    json.dump({}, f, indent=2, ensure_ascii=False)
+                logger.info("Initialized PROJECT_INDEX.json in %s", project_dir)
+            except Exception as e:
+                logger.error("Failed to initialize PROJECT_INDEX.json: %s", e)
+
+
     def _ensure_agent_config(self, conversation: Conversation) -> bool:
         """Ensure per-conversation agent config exists; prompt user if missing."""
         cfg = conversation.agent_config if isinstance(
             conversation.agent_config, dict) else {}
         project_name = str(cfg.get("project_name", "")).strip()
         project_dir = str(cfg.get("project_dir", "")).strip()
-        if project_name and project_dir and os.path.isdir(project_dir):
+
+        # Generate default project_dir if not set
+        if not project_dir:
+            # New unique directory for this conversation's agent memory
+            default_project_dir = os.path.join(
+                storage._get_config_dir(), "agent_workspaces", conversation.id
+            )
+            os.makedirs(default_project_dir, exist_ok=True)
+            project_dir = default_project_dir
+            # Initialize agent_config if it was None
+            if conversation.agent_config is None:
+                conversation.agent_config = {}
+            conversation.agent_config["project_dir"] = project_dir
+            self._save_conversations() # Save the new project_dir
+
+        # Initialize memory files if they don't exist
+        self._initialize_agent_memory_files(project_dir)
+
+        # Pre-check: if a project name is also set (either loaded or by default) and directory exists,
+        # we can skip the dialog. User can still re-enter config via settings panel.
+        if project_name and os.path.isdir(project_dir): # Check after potential auto-creation
             return True
 
+        # Existing dialog code (if project_name or dir is still missing, or user wants to change)
         dialog = Gtk.Dialog(
             title="Agent Setup",
             transient_for=self,
@@ -2481,7 +2665,7 @@ class MainWindow(Gtk.ApplicationWindow):
         dir_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         dir_entry = Gtk.Entry()
         dir_entry.set_hexpand(True)
-        dir_entry.set_text(project_dir or self._get_workspace_root())
+        dir_entry.set_text(project_dir) # Use the potentially auto-generated project_dir
         browse_btn = Gtk.Button(label="Browse…")
 
         def _on_browse_clicked(_btn):
@@ -2526,20 +2710,11 @@ class MainWindow(Gtk.ApplicationWindow):
         if not selected_name:
             self._show_error_dialog("Agent Setup", "Project name is required.")
             return False
-        if not selected_dir:
-            self._show_error_dialog(
-                "Agent Setup", "Project directory is required.")
-            return False
-        # Prevent selecting a project directory that is inside the application repo
-        app_root = getattr(self, "_app_root", os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
-        sel_abs = os.path.abspath(selected_dir)
-        if sel_abs == app_root or sel_abs.startswith(app_root + os.sep):
-            self._show_error_dialog("Agent Setup", "Selected project directory is inside the application directory. Choose a directory outside the app source to allow filesystem tools.")
-            return False
-        if not os.path.isdir(selected_dir):
+        # selected_dir should already be valid due to auto-generation or user selection
+        if not os.path.isdir(selected_dir): # Re-check if user manually typed something invalid
             try:
-                os.makedirs(selected_dir, exist_ok=True)
-            except Exception as e:
+                os.makedirs(selected_dir)
+            except OSError as e:
                 self._show_error_dialog(
                     "Agent Setup",
                     f"Could not create project directory:\n{e}",
@@ -3300,7 +3475,7 @@ class MainWindow(Gtk.ApplicationWindow):
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "path": {"type": "string", "description": "Workspace-relative file path."},
+                            "path": {"type": "string", "description": "Workspace-relative file path (e.g., 'src/main.py'). Must not be empty, absolute, or contain '..'."},
                             "max_chars": {"type": "integer", "description": "Optional max chars to read."},
                         },
                         "required": ["path"],
@@ -3315,7 +3490,7 @@ class MainWindow(Gtk.ApplicationWindow):
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "path": {"type": "string", "description": "Workspace-relative file path."},
+                            "path": {"type": "string", "description": "Workspace-relative file path (e.g., 'src/main.py'). Must not be empty, absolute, or contain '..'."},
                             "content": {"type": "string", "description": "Full file content to write."},
                         },
                         "required": ["path", "content"],
@@ -3330,7 +3505,7 @@ class MainWindow(Gtk.ApplicationWindow):
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "path": {"type": "string", "description": "Workspace-relative file path."},
+                            "path": {"type": "string", "description": "Workspace-relative file path (e.g., 'src/main.py'). Must not be empty, absolute, or contain '..'."},
                             "find": {"type": "string", "description": "Exact text to find."},
                             "replace": {"type": "string", "description": "Replacement text."},
                             "replace_all": {"type": "boolean", "description": "Replace all occurrences."},
@@ -3347,7 +3522,7 @@ class MainWindow(Gtk.ApplicationWindow):
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "path": {"type": "string", "description": "Workspace-relative file path."},
+                            "path": {"type": "string", "description": "Workspace-relative file path (e.g., 'src/main.py'). Must not be empty, absolute, or contain '..'."},
                         },
                         "required": ["path"],
                     },
@@ -3518,6 +3693,15 @@ class MainWindow(Gtk.ApplicationWindow):
 
     async def _tool_builtin_read_file(self, args: dict) -> dict:
         """Built-in filesystem read file tool."""
+        rel_path = str(args.get("path", "")).strip()
+
+        if not rel_path:
+            return {"ok": False, "error": "File path cannot be empty. Please provide a valid path within the project directory."}
+        
+        # Additional check to prevent path traversal attempts or invalid characters
+        if ".." in rel_path or os.path.isabs(rel_path) or any(c in rel_path for c in ['<', '>', ':', '"', '|', '?', '*']):
+            return {"ok": False, "error": f"Invalid characters or path traversal attempt in '{rel_path}'. Please provide a simple relative path."}
+
         return await self._tool_read_file(args)
 
     async def _tool_summarize_file_for_index(self, args: dict) -> dict:
@@ -3706,9 +3890,18 @@ class MainWindow(Gtk.ApplicationWindow):
         """Built-in filesystem write/overwrite tool."""
         rel_path = str(args.get("path", "")).strip()
         content = str(args.get("content", ""))
+        
+        if not rel_path:
+            return {"ok": False, "error": "File path cannot be empty. Please provide a valid path within the project directory."}
+        
+        # Additional check to prevent path traversal attempts or invalid characters
+        if ".." in rel_path or os.path.isabs(rel_path) or any(c in rel_path for c in ['<', '>', ':', '"', '|', '?', '*']):
+            return {"ok": False, "error": f"Invalid characters or path traversal attempt in '{rel_path}'. Please provide a simple relative path."}
+
         target = self._safe_path(rel_path)
-        if not rel_path or not target:
-            return {"ok": False, "error": "Invalid file path"}
+        if not target: # _safe_path returns None if path is outside sandbox
+            return {"ok": False, "error": f"Invalid or unsafe file path: '{rel_path}'. Path must be relative and within the project directory."}
+        
         try:
             parent = os.path.dirname(target)
             if parent:
@@ -3729,15 +3922,24 @@ class MainWindow(Gtk.ApplicationWindow):
         except Exception as e:
             return {"ok": False, "error": f"Failed to write file: {e}"}
 
+
     async def _tool_builtin_edit_file(self, args: dict) -> dict:
         """Built-in filesystem find/replace edit tool."""
         rel_path = str(args.get("path", "")).strip()
         find_text = str(args.get("find", ""))
         replace_text = str(args.get("replace", ""))
         replace_all = bool(args.get("replace_all", False))
+
+        if not rel_path:
+            return {"ok": False, "error": "File path cannot be empty. Please provide a valid path within the project directory."}
+        
+        # Additional check to prevent path traversal attempts or invalid characters
+        if ".." in rel_path or os.path.isabs(rel_path) or any(c in rel_path for c in ['<', '>', ':', '"', '|', '?', '*']):
+            return {"ok": False, "error": f"Invalid characters or path traversal attempt in '{rel_path}'. Please provide a simple relative path."}
+
         target = self._safe_path(rel_path)
-        if not rel_path or not target or not os.path.isfile(target):
-            return {"ok": False, "error": "Invalid file path"}
+        if not target or not os.path.isfile(target): # _safe_path returns None if path is outside sandbox
+            return {"ok": False, "error": f"Invalid or unsafe file path: '{rel_path}'. Path must be relative and within the project directory."}
         if find_text == "":
             return {"ok": False, "error": "'find' must not be empty"}
         try:
@@ -3777,12 +3979,21 @@ class MainWindow(Gtk.ApplicationWindow):
         except Exception as e:
             return {"ok": False, "error": f"Failed to edit file: {e}"}
 
+
     async def _tool_builtin_delete_file(self, args: dict) -> dict:
         """Built-in filesystem delete file tool with mandatory double confirmation."""
         rel_path = str(args.get("path", "")).strip()
+
+        if not rel_path:
+            return {"ok": False, "error": "File path cannot be empty. Please provide a valid path within the project directory."}
+        
+        # Additional check to prevent path traversal attempts or invalid characters
+        if ".." in rel_path or os.path.isabs(rel_path) or any(c in rel_path for c in ['<', '>', ':', '"', '|', '?', '*']):
+            return {"ok": False, "error": f"Invalid characters or path traversal attempt in '{rel_path}'. Please provide a simple relative path."}
+
         target = self._safe_path(rel_path)
-        if not rel_path or not target or not os.path.isfile(target):
-            return {"ok": False, "error": "Invalid file path"}
+        if not target or not os.path.isfile(target): # _safe_path returns None if path is outside sandbox
+            return {"ok": False, "error": f"Invalid or unsafe file path: '{rel_path}'. Path must be relative and within the project directory."}
         allowed = await asyncio.to_thread(self._confirm_delete_file_twice_blocking, rel_path)
         if not allowed:
             return {"ok": False, "error": "Deletion rejected by user"}
@@ -4003,6 +4214,61 @@ class MainWindow(Gtk.ApplicationWindow):
         if candidate == root_dir or candidate.startswith(root):
             return candidate
         return None
+
+    def _generate_simple_project_map(self, project_dir: str, max_depth: int = 2, ignore_patterns: Optional[list[str]] = None) -> str:
+        """Generates a simple, text-based map of the project directory.
+
+        Args:
+            project_dir: The root directory of the project.
+            max_depth: Maximum directory depth to traverse.
+            ignore_patterns: List of glob patterns to ignore (e.g., ['*.pyc', '__pycache__']).
+
+        Returns:
+            A string representing the project map.
+        """
+        if not os.path.isdir(project_dir):
+            return f"Project directory not found: {project_dir}"
+
+        output = [f"Project Map for: {project_dir}"]
+        ignore_patterns = ignore_patterns or [
+            '__pycache__', '.git', '.venv', 'venv', 'node_modules', '*.pyc', '*.bak', '*.swp',
+            '*.log', 'tmp', '.DS_Store', 'Thumbs.db'
+        ]
+
+        def _should_ignore(path_name: str, is_dir: bool) -> bool:
+            for pattern in ignore_patterns:
+                if fnmatch.fnmatch(path_name, pattern):
+                    return True
+                # Special handling for directories, match pattern against directory name
+                if is_dir and fnmatch.fnmatch(os.path.basename(path_name), pattern):
+                    return True
+            return False
+
+        for root, dirs, files in os.walk(project_dir):
+            rel_path = os.path.relpath(root, project_dir)
+            if rel_path == ".":
+                level = 0
+            else:
+                level = rel_path.count(os.sep) + 1
+
+            if level > max_depth:
+                del dirs[:] # Don't traverse deeper
+                continue
+            
+            # Filter ignored directories
+            dirs[:] = [d for d in dirs if not _should_ignore(d, is_dir=True)]
+
+            indent = "  " * level
+            if level == 0:
+                output.append(f"{indent}.")
+            else:
+                output.append(f"{indent}{os.path.basename(root)}/")
+            
+            for f_name in files:
+                if not _should_ignore(f_name, is_dir=False):
+                    output.append(f"{indent}  {f_name}")
+        
+        return "\n".join(output)
 
     def _get_workspace_root(self) -> str:
         """Return the effective workspace root for the current context."""

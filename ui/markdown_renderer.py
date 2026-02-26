@@ -1,13 +1,15 @@
 """
 Markdown-to-GTK rendering for AI response formatting.
-Supports: **bold**, *italic*, `inline code`, ```code blocks```.
-Also parses thinking (<think>...</think>) vs response for ChatGPT/DeepSeek-style display.
+Supports full markdown (via mistune) and collapsible thinking sections.
 """
 import re
+import json
 import gi
+import mistune
+from typing import Optional, Tuple, List
 
 gi.require_version("Gtk", "3.0")
-from gi.repository import Gtk, Gdk, Pango
+from gi.repository import Gtk, Gdk, Pango, GLib
 
 
 class ClampedTextView(Gtk.TextView):
@@ -28,7 +30,7 @@ class ClampedTextView(Gtk.TextView):
         return (min(minimum, cap), min(natural, cap))
 
 
-def split_thinking_and_response(content: str) -> tuple[str, str]:
+def split_thinking_and_response(content: str) -> Tuple[str, str]:
     """Split model output into reasoning/thinking and final response text.
 
     Handles variants commonly seen in model output:
@@ -55,7 +57,7 @@ def split_thinking_and_response(content: str) -> tuple[str, str]:
         re.IGNORECASE | re.DOTALL,
     )
 
-    thinking_parts: list[str] = []
+    thinking_parts: List[str] = []
 
     def _collect_and_strip(match: re.Match) -> str:
         body = (match.group("body") or "").strip()
@@ -83,7 +85,7 @@ def split_thinking_and_response(content: str) -> tuple[str, str]:
     return (thinking, response)
 
 
-def extract_ai_tasks_and_response(content: str) -> tuple[list[dict], str]:
+def extract_ai_tasks_and_response(content: str) -> Tuple[List[dict], str]:
     """Extract <ai_tasks> (or <aitasks>) block and return (tasks, remaining_response)."""
     if not content:
         return ([], "")
@@ -99,7 +101,7 @@ def extract_ai_tasks_and_response(content: str) -> tuple[list[dict], str]:
         re.IGNORECASE | re.DOTALL,
     )
 
-    task_blocks: list[str] = []
+    task_blocks: List[str] = []
 
     def _collect_and_strip(match: re.Match) -> str:
         body = (match.group("body") or "").strip()
@@ -111,7 +113,7 @@ def extract_ai_tasks_and_response(content: str) -> tuple[list[dict], str]:
     if not task_blocks:
         return ([], response)
 
-    tasks: list[dict] = []
+    tasks: List[dict] = []
     seen = set()
     for block in task_blocks:
         for raw_line in block.splitlines():
@@ -144,234 +146,282 @@ def extract_ai_tasks_and_response(content: str) -> tuple[list[dict], str]:
     return (tasks, response)
 
 
-def _parse_markdown_segments(text: str) -> list[tuple[str, str | None]]:
-    """Parse markdown and return list of (content, format_type) segments.
-    
-    format_type: None (normal), "bold", "italic", "code", "code_block", 
-                 "h1", "h2", "h3", "list_item", "blockquote"
-    """
-    segments = []
-    lines = text.split('\n')
-    
-    in_code_block = False
-    current_code_block_content = []
-
-    for line_num, line in enumerate(lines):
-        # Handle code blocks
-        if line.strip().startswith("```"):
-            if in_code_block:
-                segments.append(("\n".join(current_code_block_content), "code_block"))
-                current_code_block_content = []
-                in_code_block = False
-            else:
-                in_code_block = True
-            # Add a newline for block separation
-            if line_num < len(lines) - 1 or segments and segments[-1][1] != "code_block":
-                 segments.append(("\n", None))
-            continue
-        
-        if in_code_block:
-            current_code_block_content.append(line)
-            continue
-
-        # Handle block-level elements (headings, blockquotes, list items)
-        # These should start a new line and consume the whole line
-        if line.startswith("# "):
-            segments.append((line[2:], "h1"))
-            segments.append(("\n", None))
-            continue
-        if line.startswith("## "):
-            segments.append((line[3:], "h2"))
-            segments.append(("\n", None))
-            continue
-        if line.startswith("### "):
-            segments.append((line[4:], "h3"))
-            segments.append(("\n", None))
-            continue
-        if line.startswith("> "):
-            segments.append((line[2:], "blockquote"))
-            segments.append(("\n", None))
-            continue
-        if line.startswith("* ") or line.startswith("- "):
-            segments.append(("\u2022 " + line[2:], "list_item"))
-            segments.append(("\n", None))
-            continue
-
-        # Process inline elements for normal lines
-        i = 0
-        line_segments = []
-        while i < len(line):
-            # Inline code (`...`) - handle before bold/italic to prevent issues with `**` inside code
-            if line[i] == '`' and (i == 0 or line[i-1] != '\\'): # Ensure it's not an escaped backtick
-                end = -1
-                for j in range(i + 1, len(line)):
-                    if line[j] == '`' and (j == 0 or line[j-1] != '\\'):
-                        end = j
-                        break
-                if end != -1:
-                    line_segments.append((line[i+1:end], "code"))
-                    i = end + 1
-                    continue
-            
-            # Bold (**text** or __text__)
-            if line[i:i+2] == "**":
-                end = line.find("**", i + 2)
-                if end != -1:
-                    line_segments.append((line[i+2:end], "bold"))
-                    i = end + 2
-                    continue
-            if line[i:i+2] == "__":
-                end = line.find("__", i + 2)
-                if end != -1:
-                    line_segments.append((line[i+2:end], "bold"))
-                    i = end + 2
-                    continue
-            
-            # Italic (*text* or _text_)
-            if line[i] == "*" and (i == 0 or line[i-1] != '\\'):
-                end = -1
-                for j in range(i + 1, len(line)):
-                    if line[j] == '*' and (j == 0 or line[j-1] != '\\'):
-                        if line[j-1:j+1] != "**": # Avoid matching **
-                            end = j
-                            break
-                if end != -1:
-                    line_segments.append((line[i+1:end], "italic"))
-                    i = end + 1
-                    continue
-            if line[i] == "_" and (i == 0 or line[i-1] != '\\'):
-                end = -1
-                for j in range(i + 1, len(line)):
-                    if line[j] == '_' and (j == 0 or line[j-1] != '\\'):
-                        if line[j-1:j+1] != "__": # Avoid matching __
-                            end = j
-                            break
-                if end != -1:
-                    line_segments.append((line[i+1:end], "italic"))
-                    i = end + 1
-                    continue
-            
-            # Normal text - find next special char
-            next_inline_token_pos = len(line)
-            for delim in ("`", "**", "__", "*", "_"):
-                idx = line.find(delim, i)
-                if idx != -1:
-                    next_inline_token_pos = min(next_inline_token_pos, idx)
-            
-            if next_inline_token_pos > i:
-                line_segments.append((line[i:next_inline_token_pos], None))
-                i = next_inline_token_pos
-            else:
-                line_segments.append((line[i], None))
-                i += 1
-        
-        segments.extend(line_segments)
-        # Add newline after each line unless it's the last line and empty or already handled by block elements
-        if line_num < len(lines) - 1 or line: # Only add newline if not last line OR last line is not empty
-            segments.append(("\n", None))
-
-    # Add any remaining code block content if the file ended unexpectedly
-    if in_code_block and current_code_block_content:
-        segments.append(("\n".join(current_code_block_content), "code_block"))
-    
-    return segments
-
-
 def _create_text_tags(table: Gtk.TextTagTable) -> dict[str, Gtk.TextTag]:
     """Create and register text tags for markdown formatting."""
     tags = {}
-    
+
     # Bold
     tag = Gtk.TextTag(name="bold")
+    tag.set_property("weight", Pango.Weight.BOLD)
     table.add(tag)
     tags["bold"] = tag
-    
+
     # Italic
     tag = Gtk.TextTag(name="italic")
+    tag.set_property("style", Pango.Style.ITALIC)
     table.add(tag)
     tags["italic"] = tag
-    
+
     # Inline code
     tag = Gtk.TextTag(name="code")
+    tag.set_property("font", "Monospace 10")
+    tag.set_property("foreground", "#f8f8f2")
+    tag.set_property("background", "#2d2d2d")
+    tag.set_property("scale", 0.9)
     table.add(tag)
     tags["code"] = tag
-    
+
     # Code block
     tag = Gtk.TextTag(name="code_block")
+    tag.set_property("font", "Monospace 10")
+    tag.set_property("foreground", "#d4d4d4")
+    tag.set_property("background", "#1e1e1e")
+    tag.set_property("scale", 0.9)
+    tag.set_property("left-margin", 12)
+    tag.set_property("right-margin", 12)
+    tag.set_property("pixels-above-lines", 4)
+    tag.set_property("pixels-below-lines", 4)
     table.add(tag)
     tags["code_block"] = tag
 
     # Headings
-    tag = Gtk.TextTag(name="h1")
-    table.add(tag)
-    tags["h1"] = tag
-
-    tag = Gtk.TextTag(name="h2")
-    table.add(tag)
-    tags["h2"] = tag
-
-    tag = Gtk.TextTag(name="h3")
-    table.add(tag)
-    tags["h3"] = tag
+    for level, size in [(1, 1.8), (2, 1.5), (3, 1.3)]:
+        name = f"h{level}"
+        tag = Gtk.TextTag(name=name)
+        tag.set_property("weight", Pango.Weight.BOLD)
+        tag.set_property("scale", size)
+        tag.set_property("pixels-above-lines", 8)
+        tag.set_property("pixels-below-lines", 2)
+        table.add(tag)
+        tags[name] = tag
 
     # Blockquote
     tag = Gtk.TextTag(name="blockquote")
+    tag.set_property("style", Pango.Style.ITALIC)
+    tag.set_property("background", "#3a3a3a")
+    tag.set_property("left-margin", 24)
+    tag.set_property("right-margin", 12)
+    tag.set_property("pixels-above-lines", 4)
+    tag.set_property("pixels-below-lines", 4)
     table.add(tag)
     tags["blockquote"] = tag
 
-    # List item
+    # List item (used with bullet prefix)
     tag = Gtk.TextTag(name="list_item")
+    tag.set_property("left-margin", 24)
+    tag.set_property("pixels-below-lines", 2)
     table.add(tag)
     tags["list_item"] = tag
-    
+
+    # Link
+    tag = Gtk.TextTag(name="link")
+    tag.set_property("foreground", "#1e90ff")
+    tag.set_property("underline", Pango.Underline.SINGLE)
+    tag.set_property("underline-rgba", Gdk.RGBA(0.12, 0.56, 1.0, 1.0))
+    table.add(tag)
+    tags["link"] = tag
+
     return tags
 
 
-def build_formatted_text_view(content: str, max_width: int = 360) -> Gtk.TextView:
-    """Build a Gtk.TextView with markdown formatting applied.
-    
+class GtkMarkdownRenderer(mistune.HTMLRenderer):
+    """Custom mistune renderer that outputs directly to a GtkTextBuffer."""
+
+    def __init__(self, buffer: Gtk.TextBuffer, tags: dict):
+        super().__init__()
+        self.buffer = buffer
+        self.tags = tags
+        self.iter = buffer.get_end_iter()
+        self.list_level = 0
+        self.in_blockquote = False
+
+    def text(self, text):
+        self.buffer.insert(self.iter, text)
+        return text
+
+    def emphasis(self, text):
+        self.buffer.insert_with_tags_by_name(self.iter, text, "italic")
+        return text
+
+    def strong(self, text):
+        self.buffer.insert_with_tags_by_name(self.iter, text, "bold")
+        return text
+
+    def link(self, link, text=None, title=None):
+        # Insert the link text with the link tag
+        display_text = text or link
+        self.buffer.insert_with_tags_by_name(self.iter, display_text, "link")
+        # Store the URL in a data attribute on the tag's range (for click handling)
+        # We'll store it in a separate dict keyed by the start offset
+        start_offset = self.iter.get_offset() - len(display_text)
+        end_offset = self.iter.get_offset()
+        self.buffer.set_data(f"link_{start_offset}_{end_offset}", link)
+        return ""
+
+    def codespan(self, text):
+        self.buffer.insert_with_tags_by_name(self.iter, text, "code")
+        return text
+
+    def block_code(self, code, info=None):
+        # Insert a copy button + code block
+        # We'll create a custom widget: a Gtk.Box with a copy button and a TextView for the code.
+        # But since we're inside a renderer that expects to write to a buffer, we'll instead
+        # insert a placeholder marker and later replace it with the widget.
+        # For simplicity, we'll just insert the code with the code_block tag.
+        # If you want a copy button, you'll need to restructure the message container.
+        # We'll leave that as a future enhancement; for now just use code_block tag.
+        self.buffer.insert(self.iter, code)
+        # Apply code_block tag to the whole block
+        end_iter = self.buffer.get_end_iter()
+        start_iter = self.buffer.get_iter_at_offset(self.iter.get_offset() - len(code))
+        self.buffer.apply_tag(self.tags["code_block"], start_iter, end_iter)
+        self.buffer.insert(self.iter, "\n")
+        return ""
+
+    def block_quote(self, text):
+        self.in_blockquote = True
+        self.buffer.insert(self.iter, text)
+        # Apply blockquote tag to the whole block
+        end_iter = self.buffer.get_end_iter()
+        start_iter = self.buffer.get_iter_at_offset(self.iter.get_offset() - len(text))
+        self.buffer.apply_tag(self.tags["blockquote"], start_iter, end_iter)
+        self.in_blockquote = False
+        return ""
+
+    def heading(self, text, level):
+        level = min(level, 3)  # Only h1-h3 supported
+        tag_name = f"h{level}"
+        self.buffer.insert_with_tags_by_name(self.iter, text + "\n", tag_name)
+        return text
+
+    def list(self, text, ordered, level, start=None):
+        # The list marker is handled by list_item
+        self.buffer.insert(self.iter, text)
+        return text
+
+    def list_item(self, text, level):
+        # Prepend bullet/number marker
+        marker = "• " if level == 1 else "  • "
+        self.buffer.insert_with_tags_by_name(self.iter, marker + text, "list_item")
+        self.buffer.insert(self.iter, "\n")
+        return ""
+
+    def thematic_break(self):
+        self.buffer.insert(self.iter, "—\n")
+        return ""
+
+    def linebreak(self):
+        self.buffer.insert(self.iter, "\n")
+        return ""
+
+    def softbreak(self):
+        self.buffer.insert(self.iter, " ")
+        return ""
+
+
+def build_formatted_text_view(content: str, max_width: int = 360) -> Gtk.Widget:
+    """Build a widget with markdown formatting applied.
+
+    If content contains a <think> section, returns a Gtk.Box with an expander
+    for thinking and a TextView for the response. Otherwise returns a single
+    TextView with the whole content.
+
     Args:
-        content: Raw message content (may contain markdown).
-        
+        content: Raw message content (may contain markdown and thinking tags).
+        max_width: Maximum width for text wrapping (clamped).
+
     Returns:
-        Configured Gtk.TextView with formatted content.
+        Gtk.Widget (either Gtk.TextView or Gtk.Box) with formatted content.
     """
-    buffer = Gtk.TextBuffer()
-    tags = _create_text_tags(buffer.get_tag_table())
-    
-    segments = _parse_markdown_segments(content)
-    it = buffer.get_start_iter()
-    
-    for text, fmt in segments:
-        if not text and fmt is None: # Skip empty normal text segments
-            continue
-        
-        # Insert text and apply tag
-        if fmt:
-            buffer.insert_with_tags_by_name(it, text, fmt)
-        else:
-            buffer.insert(it, text)
-    
-    view = ClampedTextView(buffer=buffer, max_width=max_width)
-    view.get_style_context().add_class('markdown-view')
-    view.set_editable(False)
-    view.set_cursor_visible(False)
-    # WORD_CHAR prevents extremely long unbroken tokens (URLs/JSON/base64)
-    # from requesting absurd widths that can crash Wayland/GDK surfaces.
-    view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
-    view.set_left_margin(4)
-    view.set_right_margin(4)
-    view.set_top_margin(4)
-    view.set_bottom_margin(4)
-    view.set_pixels_above_lines(2)
-    view.set_pixels_below_lines(2)
-    # Allow flexible width up to max_width, not a hard requirement
-    # Use -1 for width to let parent container control width, but max_width for clamping
-    view.set_size_request(-1, -1)
-    view.set_hexpand(True)
-    view.set_halign(Gtk.Align.FILL)
-    # Transparent background - inherits from parent bubble
-    view.override_background_color(Gtk.StateFlags.NORMAL, Gdk.RGBA(0, 0, 0, 0))
-    view.override_color(Gtk.StateFlags.NORMAL, Gdk.RGBA(1, 1, 1, 1))
-    
-    return view
+    # First extract thinking and response
+    thinking, response = split_thinking_and_response(content)
+
+    # Helper to render markdown into a TextView
+    def render_to_textview(text: str) -> Gtk.TextView:
+        buffer = Gtk.TextBuffer()
+        tags = _create_text_tags(buffer.get_tag_table())
+
+        if text.strip():
+            # Use mistune to parse and render
+            renderer = GtkMarkdownRenderer(buffer, tags)
+            markdown = mistune.create_markdown(renderer=renderer)
+            markdown(text)
+
+        view = ClampedTextView(buffer=buffer, max_width=max_width)
+        view.get_style_context().add_class('markdown-view')
+        view.set_editable(False)
+        view.set_cursor_visible(False)
+        view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        view.set_left_margin(4)
+        view.set_right_margin(4)
+        view.set_top_margin(4)
+        view.set_bottom_margin(4)
+        view.set_pixels_above_lines(2)
+        view.set_pixels_below_lines(2)
+        view.set_hexpand(True)
+        view.set_halign(Gtk.Align.FILL)
+        # Transparent background - inherits from parent bubble
+        view.override_background_color(Gtk.StateFlags.NORMAL, Gdk.RGBA(0, 0, 0, 0))
+        view.override_color(Gtk.StateFlags.NORMAL, Gdk.RGBA(1, 1, 1, 1))
+
+        # Connect link clicks
+        view.connect("event", _on_text_view_event, buffer)
+        return view
+
+    # Build the final widget
+    if thinking and response:
+        # Create container
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+
+        # Thinking expander
+        expander = Gtk.Expander(label="💭 Reasoning (click to expand)")
+        expander.set_use_markup(True)
+        expander.set_expanded(False)  # Collapsed by default
+
+        thinking_view = render_to_textview(thinking)
+        thinking_view.set_size_request(max_width, -1)
+        expander.add(thinking_view)
+
+        box.pack_start(expander, False, False, 0)
+
+        # Response view
+        response_view = render_to_textview(response)
+        box.pack_start(response_view, True, True, 0)
+
+        box.show_all()
+        return box
+    else:
+        # Only response or only thinking (rare)
+        return render_to_textview(content)
+
+
+def _on_text_view_event(view: Gtk.TextView, event: Gdk.Event, buffer: Gtk.TextBuffer) -> bool:
+    """Handle button clicks on the TextView to open links."""
+    if event.type != Gdk.EventType.BUTTON_RELEASE or event.button != 1:
+        return False
+
+    # Get coordinates and resolve to text position
+    x, y = view.window_to_buffer_coords(Gtk.TextWindowType.TEXT, int(event.x), int(event.y))
+    iter_pos = view.get_iter_at_location(x, y)
+    if not iter_pos:
+        return False
+
+    # Check if the position has the link tag
+    tags_at_cursor = iter_pos.get_tags()
+    for tag in tags_at_cursor:
+        if tag.get_property("name") == "link":
+            # Find the whole range of the link tag
+            start = iter_pos.copy()
+            end = iter_pos.copy()
+            start.backward_to_tag_toggle(tag)
+            end.forward_to_tag_toggle(tag)
+            # Ensure we have the full range
+            if not start.starts_tag(tag):
+                start.forward_to_tag_toggle(tag)
+            if not end.ends_tag(tag):
+                end.backward_to_tag_toggle(tag)
+            url = buffer.get_text(start, end, False).strip()
+            if url:
+                Gtk.show_uri_on_window(None, url, Gdk.CURRENT_TIME)
+                return True
+    return False

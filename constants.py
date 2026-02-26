@@ -128,7 +128,7 @@ CHARS_PER_TOKEN_EST = 4  # Rough estimate for token counting
 API_ENDPOINT_DEFAULT = "http://localhost:1234/v1"
 API_CHAT_COMPLETIONS = "/chat/completions"
 API_MODELS = "/models"
-API_TIMEOUT = 60
+API_TIMEOUT = 120
 API_RECONNECT_INTERVAL = 5000  # ms
 
 # Default settings

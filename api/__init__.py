@@ -31,24 +31,28 @@ class ConnectionError(LMStudioError):
 class LMStudioClient:
     """Client for communicating with LM Studio API."""
 
-    def __init__(self, endpoint: str = C.API_ENDPOINT_DEFAULT):
+    def __init__(self, endpoint: str = C.API_ENDPOINT_DEFAULT, on_auto_tool_approval_changed: Optional[Callable[[bool], None]] = None):
         """Initialize the LM Studio client.
         
         Args:
             endpoint: Base URL of the LM Studio API (e.g., http://localhost:1234/v1)
+            on_auto_tool_approval_changed: Callback to inform main window of auto-approval change.
         """
         self.endpoint = endpoint
         self.session: Optional[aiohttp.ClientSession] = None
         self._is_connected = False
-
-    async def initialize(self) -> None:
-        """Asynchronously initialize the HTTP session."""
-        self.session = aiohttp.ClientSession()
+        self.on_auto_tool_approval_changed = on_auto_tool_approval_changed
 
     async def close(self) -> None:
         """Close the HTTP session."""
-        if self.session:
+        if self.session and not self.session.closed:
             await self.session.close()
+            self.session = None # Explicitly set to None after closing
+
+    async def initialize(self) -> None:
+        """Asynchronously initialize the HTTP session."""
+        if not self.session or self.session.closed:
+            self.session = aiohttp.ClientSession()
 
     async def check_connection(self) -> bool:
         """Check if LM Studio is available.
@@ -111,6 +115,41 @@ class LMStudioClient:
             logger.error(f"Failed to read loaded model id: {e}")
         return None
 
+    async def unload_model(self, instance_id: str) -> bool:
+        """Unloads a model from LM Studio.
+        
+        Args:
+            instance_id: Unique identifier of the model instance to unload.
+            
+        Returns:
+            True if model unloaded successfully, False otherwise.
+        """
+        if not self.session:
+            logger.warning("Attempted to unload model without an active session.")
+            return False
+        
+        unload_endpoint = f"{self.endpoint}/models/unload"
+        payload = {"instance_id": instance_id}
+        headers = {"Content-Type": "application/json"}
+        
+        try:
+            async with self.session.post(
+                unload_endpoint,
+                json=payload,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=C.API_TIMEOUT), # Use global API timeout
+            ) as resp:
+                if resp.status == 200:
+                    logger.info("Successfully unloaded model: %s", instance_id)
+                    return True
+                else:
+                    error_text = await resp.text()
+                    logger.error("Failed to unload model %s. API error %s: %s", instance_id, resp.status, error_text)
+                    return False
+        except Exception as e:
+            logger.error("Error unloading model %s: %s", instance_id, e)
+            return False
+
     async def chat_completion(
         self,
         conversation: Conversation,
@@ -135,6 +174,68 @@ class LMStudioClient:
         )
         if final_text:
             yield final_text
+
+    async def load_model(self, model_id: str) -> bool:
+        """Loads a model into LM Studio.
+        
+        Args:
+            model_id: The ID of the model to load (e.g., "openai/gpt-oss-20b").
+            
+        Returns:
+            True if model loading was initiated successfully, False otherwise.
+        """
+        if not self.session:
+            logger.warning("Attempted to load model without an active session.")
+            return False
+        
+        load_endpoint = f"{self.endpoint}/models/load" # Assuming this endpoint exists
+        payload = {"model": model_id}
+        headers = {"Content-Type": "application/json"}
+        
+        try:
+            async with self.session.post(
+                load_endpoint,
+                json=payload,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=C.API_TIMEOUT), # Use global API timeout
+            ) as resp:
+                if resp.status == 200:
+                    logger.info("Successfully initiated loading of model: %s", model_id)
+                    return True
+                else:
+                    error_text = await resp.text()
+                    logger.error("Failed to initiate loading of model %s. API error %s: %s", model_id, resp.status, error_text)
+                    return False
+        except Exception as e:
+            logger.error("Error initiating loading of model %s: %s", model_id, e)
+            return False
+
+    async def _wait_and_poll_model_readiness(self, model_id: str, initial_wait: int = 20, max_retries: int = 5, retry_interval: int = 5) -> bool:
+        """Waits for an initial period and then polls LM Studio until the model is ready.
+        
+        Args:
+            model_id: The ID of the model to check for readiness.
+            initial_wait: Initial wait time in seconds before starting to poll.
+            max_retries: Maximum number of times to poll.
+            retry_interval: Time in seconds between polling attempts.
+            
+        Returns:
+            True if model becomes ready within the retries, False otherwise.
+        """
+        logger.info("Waiting for %d seconds before polling for model readiness...", initial_wait)
+        await asyncio.sleep(initial_wait)
+        
+        for i in range(max_retries):
+            logger.info("Polling for model readiness (attempt %d/%d)...", i + 1, max_retries)
+            loaded_id = await self.get_loaded_model_id()
+            if loaded_id == model_id:
+                logger.info("Model %s is now ready.", model_id)
+                return True
+            logger.debug("Model %s not yet ready. Current loaded: %s", model_id, loaded_id)
+            await asyncio.sleep(retry_interval)
+            
+        logger.warning("Model %s did not become ready after %d polling attempts.", model_id, max_retries)
+        return False
 
     async def chat_completion_with_tools(
         self,
@@ -308,24 +409,36 @@ class LMStudioClient:
 
             raise LMStudioError("Exceeded tool-call round limit without final response")
         except asyncio.TimeoutError as e:
-            if self.session and not self.session.closed: await self.session.close()
-            raise LMStudioError(f"API request timed out (exceeded {C.API_TIMEOUT}s)")
+            loaded_model_id = await self.get_loaded_model_id() # This gets the currently loaded ID, not necessarily the one causing the timeout
+            target_model_id = conversation.model # This is the model that was supposed to generate the response
+            if loaded_model_id:
+                logger.info("API request timed out with model %s. Attempting to unload current model: %s", target_model_id, loaded_model_id)
+                await self.unload_model(loaded_model_id) # Unload whatever was loaded
+                logger.info("Model %s should now be unloaded. Please check LM Studio.", loaded_model_id)
+
+            logger.info("Attempting to reload model: %s", target_model_id)
+            load_initiated = await self.load_model(target_model_id) # Attempt to load the model
+            
+            if load_initiated:
+                model_ready = await self._wait_and_poll_model_readiness(target_model_id, initial_wait=20)
+                if model_ready:
+                    logger.info("Model %s reloaded and is ready after timeout.", target_model_id)
+                    await asyncio.sleep(5) # Add a small delay for LM Studio to stabilize
+                else:
+                    logger.warning("Model %s could not be reloaded/became ready after timeout. Manual intervention needed.", target_model_id)
+            else:
+                logger.warning("Failed to initiate loading of model %s after timeout. Manual intervention needed.", target_model_id)
+
+            raise LMStudioError(f"API request timed out (exceeded {C.API_TIMEOUT}s). Model {target_model_id} has been re-attempted to load. Please check LM Studio status.")
         except aiohttp.ClientConnectorError as e:
-            if self.session and not self.session.closed: await self.session.close()
             raise LMStudioError(f"Failed to connect to LM Studio: {e}")
         except aiohttp.ClientSSLError as e:
-            if self.session and not self.session.closed: await self.session.close()
             raise LMStudioError(f"SSL error connecting to LM Studio: {e}")
         except aiohttp.ClientError as e:
-            if self.session and not self.session.closed: await self.session.close()
             raise LMStudioError(f"Client error: {e}")
         except Exception as e:
-            if self.session and not self.session.closed: await self.session.close()
             logger.error(f"Chat completion error: {e}")
             raise LMStudioError(f"Unexpected error: {e}")
-        finally:
-            if self.session and not self.session.closed:
-                await self.session.close()
 
     async def count_tokens(self, text: str, model: Optional[str] = None) -> int:
         """Count tokens using the configured tokenizer.
@@ -425,6 +538,29 @@ class LMStudioClient:
             message = choice.get("message") or {}
             summary_text = self._extract_assistant_content(choice, message).strip()
             return summary_text or None
+        except asyncio.TimeoutError as e:
+            target_model_id = model # Model passed to summarize_history
+            loaded_model_id = await self.get_loaded_model_id()
+            if loaded_model_id:
+                logger.info("Summarization API request timed out with model %s. Attempting to unload current model: %s", target_model_id, loaded_model_id)
+                await self.unload_model(loaded_model_id)
+                logger.info("Model %s should now be unloaded. Please check LM Studio.", loaded_model_id)
+
+            logger.info("Attempting to reload model: %s", target_model_id)
+            load_initiated = await self.load_model(target_model_id)
+            
+            if load_initiated:
+                model_ready = await self._wait_and_poll_model_readiness(target_model_id, initial_wait=20)
+                if model_ready:
+                    logger.info("Model %s reloaded and is ready after summarization timeout.", target_model_id)
+                    await asyncio.sleep(5) # Add a small delay for LM Studio to stabilize
+                else:
+                    logger.warning("Model %s could not be reloaded/became ready after summarization timeout. Manual intervention needed.", target_model_id)
+            else:
+                logger.warning("Failed to initiate loading of model %s after summarization timeout. Manual intervention needed.", target_model_id)
+
+            logger.warning("Token saver summarization failed due to timeout: %s. Model has been re-attempted to load. Manual intervention may still be needed.", e)
+            return None # Return None as summarization failed
         except Exception as e:
             logger.warning("Token saver summary failed: %s", e)
             return None
