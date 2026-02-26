@@ -4,7 +4,7 @@
 [![Python](https://img.shields.io/badge/python-3.8+-blue?logo=python&logoColor=white)](https://www.python.org/)
 [![License: GNU GPL v3](https://img.shields.io/badge/License-GNU_GPL_v3-blue)](https://www.gnu.org/licenses/gpl-3.0)
 [![GTK3](https://img.shields.io/badge/GTK-3.24+-orange?logo=gnome&logoColor=white)](https://www.gtk.org/)
-[![GitHub stars](https://img.shields.io/github/stars/yourusername/AutoAIAgent-chat-client?style=social)](https://github.com/kingnixon20/autoaiagent)
+[![GitHub stars](https://img.shields.io/github/stars/kingnixon20/AutoAIAgent?style=social)](https://github.com/kingnixon20/autoaiagent)
 
 **Fast · Native · Private**  
 A lightweight desktop chat client for local and remote LLMs with a clean, native GTK interface on Linux.
@@ -13,7 +13,7 @@ A lightweight desktop chat client for local and remote LLMs with a clean, native
 
 ## What is AutoAIAgent?
 
-AutoAIAgent is a **privacy-first**, modular desktop application for interacting with language models and running autonomous agents — both local (Ollama, LM Studio, …) and remote OpenAI-compatible endpoints.
+AutoAIAgent is a **privacy-first**, modular desktop application for interacting with language models and running autonomous coding agents — both local (Ollama, LM Studio, …) and remote OpenAI-compatible endpoints.
 
 It offers a responsive native GTK UI, real-time streaming, persistent history, token/context awareness, and powerful extensibility via the **Model Context Protocol (MCP)** for tool calling.
 

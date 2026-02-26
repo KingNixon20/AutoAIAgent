@@ -1340,22 +1340,34 @@ class MainWindow(Gtk.ApplicationWindow):
     ) -> str:
         """Prompt user for tool permission before execution unless auto-approved."""
         if not settings.auto_tool_approval:
-            approved, enable_auto = await asyncio.to_thread(
+            approved, enable_auto, denial_reason = await asyncio.to_thread(
                 self._request_tool_permission_blocking, tool_name, args
             )
             if enable_auto:
                 settings.auto_tool_approval = True
-                GLib.idle_add(lambda: self.settings_window.set_auto_tool_approval(True) or False)
+                if self.api_client and self.api_client.on_auto_tool_approval_changed:
+                    self.api_client.on_auto_tool_approval_changed(True)
+
             if not approved:
+                error_message = "Tool execution rejected by user."
+                if denial_reason:
+                    error_message = f"Tool execution denied by user with reason: {denial_reason}"
+                
                 tool_event = {
                     "name": tool_name,
                     "args": args,
                     "status": "error",
-                    "result": {"ok": False, "error": "Tool execution rejected by user."},
-                    "details": {"type": "tool_error", "message": "Tool execution rejected by user."}
+                    "result": {"ok": False, "error": error_message},
+                    "details": {"type": "tool_error", "message": error_message}
                 }
                 if on_tool_event:
                     on_tool_event(tool_event)
+                
+                # Add a system message to inform the AI about the denial
+                if self.current_conversation:
+                    denial_message = f"Tool call '{tool_name}' was denied by the user. Reason: {denial_reason or 'No reason provided.'}"
+                    self._add_system_message_and_save(denial_message, self.current_conversation.id)
+
                 return json.dumps(tool_event["result"], ensure_ascii=False)
         
         json_result, tool_event = await self._execute_tool_call(
@@ -1477,6 +1489,21 @@ class MainWindow(Gtk.ApplicationWindow):
         GLib.idle_add(_show_dialog)
         done.wait(timeout=600.0)
         return (bool(result["approved"]), bool(result["enable_auto"]), result["reason"])
+
+    def _add_system_message_and_save(self, content: str, conversation_id: str) -> None:
+        """Add a system message to the conversation and save it."""
+        if conversation_id not in self.conversations:
+            return
+        conv = self.conversations[conversation_id]
+        system_msg = Message(
+            id=str(uuid.uuid4()),
+            role=MessageRole.SYSTEM,
+            content=content,
+        )
+        conv.add_message(system_msg)
+        if self.current_conversation and self.current_conversation.id == conversation_id:
+            self.chat_area.add_message(system_msg)
+        self._save_conversations()
 
     def _add_assistant_message_and_save(
         self,
@@ -2595,32 +2622,20 @@ class MainWindow(Gtk.ApplicationWindow):
 
     def _ensure_agent_config(self, conversation: Conversation) -> bool:
         """Ensure per-conversation agent config exists; prompt user if missing."""
+        logger.debug("Ensuring agent config for conversation %s. Current agent_config: %s", conversation.id, conversation.agent_config)
         cfg = conversation.agent_config if isinstance(
             conversation.agent_config, dict) else {}
         project_name = str(cfg.get("project_name", "")).strip()
         project_dir = str(cfg.get("project_dir", "")).strip()
 
-        # Generate default project_dir if not set
-        if not project_dir:
-            # New unique directory for this conversation's agent memory
-            default_project_dir = os.path.join(
-                storage._get_config_dir(), "agent_workspaces", conversation.id
-            )
-            os.makedirs(default_project_dir, exist_ok=True)
-            project_dir = default_project_dir
-            # Initialize agent_config if it was None
-            if conversation.agent_config is None:
-                conversation.agent_config = {}
-            conversation.agent_config["project_dir"] = project_dir
-            self._save_conversations() # Save the new project_dir
-
-        # Initialize memory files if they don't exist
-        self._initialize_agent_memory_files(project_dir)
-
-        # Pre-check: if a project name is also set (either loaded or by default) and directory exists,
-        # we can skip the dialog. User can still re-enter config via settings panel.
-        if project_name and os.path.isdir(project_dir): # Check after potential auto-creation
-            return True
+        logger.debug("Checking project_dir: '%s'", project_dir)
+        if project_dir:
+            is_dir = os.path.isdir(project_dir)
+            logger.debug("os.path.isdir('%s') is %s", project_dir, is_dir)
+        
+        # If a valid project_dir is already set, we're good.
+        if project_dir and os.path.isdir(project_dir):
+            logger.debug("Valid project_dir found, skipping dialog.")
 
         # Existing dialog code (if project_name or dir is still missing, or user wants to change)
         dialog = Gtk.Dialog(
@@ -4271,24 +4286,23 @@ class MainWindow(Gtk.ApplicationWindow):
         return "\n".join(output)
 
     def _get_workspace_root(self) -> str:
-        """Return the effective workspace root for the current context."""
-        # Prefer per-conversation agent project_dir when valid and not inside app code
-        if self.current_conversation:
-            if self.current_conversation.chat_mode == "agent":
-                cfg = self.current_conversation.agent_config
-                if isinstance(cfg, dict):
-                    proj_dir = str(cfg.get("project_dir", "")).strip()
-                    if proj_dir and os.path.isdir(proj_dir):
-                        try:
-                            proj_dir_abs = os.path.abspath(proj_dir)
-                            # Reject project dirs that are inside the application code
-                            app_root = getattr(self, "_app_root", os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
-                            if proj_dir_abs == app_root or proj_dir_abs.startswith(app_root + os.sep):
-                                logger.warning("Ignoring agent project_dir inside app repo: %s", proj_dir_abs)
-                            else:
-                                return proj_dir_abs
-                        except Exception:
-                            pass
+        """Get the effective workspace root for the current conversation."""
+        logger.debug("Calling _get_workspace_root. Current conversation: %s, chat_mode: %s", 
+                     self.current_conversation.id if self.current_conversation else "None", 
+                     self.current_conversation.chat_mode if self.current_conversation else "None")
+        if (
+            self.current_conversation
+            and self.current_conversation.chat_mode == "agent"
+            and isinstance(self.current_conversation.agent_config, dict)
+        ):
+            project_dir = str(self.current_conversation.agent_config.get("project_dir", "")).strip()
+            logger.debug("Agent mode active. Project dir from agent_config: '%s'", project_dir)
+            if project_dir:
+                is_dir = os.path.isdir(project_dir)
+                logger.debug("os.path.isdir('%s') is %s", project_dir, is_dir)
+            if project_dir and os.path.isdir(project_dir):
+                return project_dir
+        logger.debug("Returning default workspace_root: '%s'", self.workspace_root)
         return self.workspace_root
 
     def _default_model_name(self) -> str:
