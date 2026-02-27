@@ -6,6 +6,7 @@ import ast
 import re
 
 def generate_project_map(root_dir='.'):
+    root_dir = str(Path(root_dir).resolve())
     map_data = []
     ignored_dirs = {'.git', 'node_modules', '__pycache__', '*.md'}
 
@@ -50,7 +51,7 @@ def generate_project_map(root_dir='.'):
                     symbols.append({'name': match.group(1), 'type': 'class', 'line': content.find(match.group(1)) + 1})
 
             map_data.append({
-                'path': str(file_path.relative_to(root_dir)),
+                'path': str(file_path.resolve()),
                 'summary': summary,
                 'symbols': symbols
             })

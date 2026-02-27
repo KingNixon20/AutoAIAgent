@@ -9,6 +9,7 @@ import asyncio
 import json
 import logging
 import re
+import threading
 from typing import Optional, AsyncIterator, Callable, Awaitable
 import aiohttp
 from models import Conversation, ConversationSettings
@@ -28,6 +29,14 @@ class ConnectionError(LMStudioError):
     pass
 
 
+class GenerationCancelled(LMStudioError):
+    """Raised when user requests cancellation of active generation."""
+
+    def __init__(self, message: str = "Generation cancelled by user.", partial_text: str = ""):
+        super().__init__(message)
+        self.partial_text = partial_text or ""
+
+
 class LMStudioClient:
     """Client for communicating with LM Studio API."""
 
@@ -42,6 +51,19 @@ class LMStudioClient:
         self.session: Optional[aiohttp.ClientSession] = None
         self._is_connected = False
         self.on_auto_tool_approval_changed = on_auto_tool_approval_changed
+        self._cancel_generation_event = threading.Event()
+
+    def request_cancel_generation(self) -> None:
+        """Request cancellation of any active generation/stream."""
+        self._cancel_generation_event.set()
+
+    def clear_cancel_generation(self) -> None:
+        """Clear cancellation state before starting a new request."""
+        self._cancel_generation_event.clear()
+
+    def is_cancel_generation_requested(self) -> bool:
+        """Check whether cancellation was requested."""
+        return self._cancel_generation_event.is_set()
 
     async def close(self) -> None:
         """Close the HTTP session."""
@@ -243,6 +265,8 @@ class LMStudioClient:
         settings: ConversationSettings,
         tool_executor: Optional[Callable[[str, dict], Awaitable[str]]] = None,
         on_tool_event: Optional[Callable[[dict], None]] = None,
+        on_text_delta: Optional[Callable[[str], None]] = None,
+        stream_response: bool = False,
         max_tool_rounds: int = 8,
     ) -> str:
         """Run completion loop with tool-call detection/execution.
@@ -319,25 +343,44 @@ class LMStudioClient:
 
         accumulated_text_parts: list[str] = []
         auto_continue_budget = 2
+        consecutive_tool_calls = 0
+        soft_tool_call_limit = 5
         try:
             for round_idx in range(max_tool_rounds):
-                response = await self._chat_completion_once(
-                    session=self.session, # Use self.session
-                    conversation=conversation,
-                    model=conversation.model,
-                    messages=messages,
-                    settings_payload=settings_payload,
-                )
-                choice = (response.get("choices") or [{}])[0]
-                message = choice.get("message") or {}
-                finish_reason = str(choice.get("finish_reason") or "")
-                content = self._extract_assistant_content(choice, message)
-                tool_calls = self._extract_tool_calls(choice, message)
+                if self.is_cancel_generation_requested():
+                    raise GenerationCancelled(partial_text="".join(accumulated_text_parts))
+                use_streaming = bool(stream_response and not normalized_tools)
+                if use_streaming:
+                    content, finish_reason = await self._chat_completion_stream_text_once(
+                        session=self.session,
+                        model=conversation.model,
+                        messages=messages,
+                        settings_payload=settings_payload,
+                        conversation=conversation,
+                        on_text_delta=on_text_delta,
+                    )
+                    choice = {"finish_reason": finish_reason}
+                    message = {"content": content}
+                    tool_calls = []
+                else:
+                    response = await self._chat_completion_once(
+                        session=self.session, # Use self.session
+                        conversation=conversation,
+                        model=conversation.model,
+                        messages=messages,
+                        settings_payload=settings_payload,
+                    )
+                    choice = (response.get("choices") or [{}])[0]
+                    message = choice.get("message") or {}
+                    finish_reason = str(choice.get("finish_reason") or "")
+                    content = self._extract_assistant_content(choice, message)
+                    tool_calls = self._extract_tool_calls(choice, message)
                 if content:
                     accumulated_text_parts.append(content)
 
                 # No tool calls: return final assistant text
                 if not tool_calls:
+                    consecutive_tool_calls = 0
                     # If model hit max_tokens, ask it to continue once/twice and merge output.
                     if finish_reason == "length" and auto_continue_budget > 0:
                         messages.append(
@@ -400,6 +443,41 @@ class LMStudioClient:
                             "content": result_text,
                         }
                     )
+                    consecutive_tool_calls += 1
+
+                    # Mandatory checkpoint after every tool call:
+                    # decide whether we already have enough information to answer.
+                    must_force_progress = consecutive_tool_calls >= soft_tool_call_limit
+                    enough_info, checkpoint_note = await self._tool_loop_checkpoint(
+                        session=self.session,
+                        model=conversation.model,
+                        messages=messages,
+                        settings_payload=settings_payload,
+                        conversation=conversation,
+                        consecutive_tool_calls=consecutive_tool_calls,
+                        force_progress_decision=must_force_progress,
+                    )
+                    if checkpoint_note:
+                        messages.append(
+                            {
+                                "role": "assistant",
+                                "content": checkpoint_note,
+                            }
+                        )
+                    if enough_info:
+                        final_text = await self._generate_final_response_without_tools(
+                            session=self.session,
+                            model=conversation.model,
+                            messages=messages,
+                            settings_payload=settings_payload,
+                            conversation=conversation,
+                        )
+                        merged = "".join(part for part in accumulated_text_parts if part)
+                        if final_text:
+                            if merged and not merged.endswith("\n"):
+                                merged += "\n"
+                            merged += final_text
+                        return merged if merged else str(final_text or "")
 
                 logger.info(
                     "Completed tool round %d with %d call(s)",
@@ -408,6 +486,13 @@ class LMStudioClient:
                 )
 
             raise LMStudioError("Exceeded tool-call round limit without final response")
+        except GenerationCancelled as e:
+            merged = "".join(part for part in accumulated_text_parts if part)
+            if e.partial_text:
+                merged += e.partial_text
+            if merged.strip():
+                return merged
+            raise
         except asyncio.TimeoutError as e:
             loaded_model_id = await self.get_loaded_model_id() # This gets the currently loaded ID, not necessarily the one causing the timeout
             target_model_id = conversation.model # This is the model that was supposed to generate the response
@@ -439,6 +524,99 @@ class LMStudioClient:
         except Exception as e:
             logger.error(f"Chat completion error: {e}")
             raise LMStudioError(f"Unexpected error: {e}")
+
+    async def _tool_loop_checkpoint(
+        self,
+        session: aiohttp.ClientSession,
+        model: str,
+        messages: list[dict],
+        settings_payload: dict,
+        conversation: Conversation,
+        consecutive_tool_calls: int,
+        force_progress_decision: bool = False,
+    ) -> tuple[bool, str]:
+        """Ask the model to explicitly evaluate whether tool loop should stop."""
+        checkpoint_instruction = (
+            "Tool-loop checkpoint.\n"
+            "Evaluate whether the assistant now has enough information to answer the user.\n"
+            "Return ONLY JSON with keys:\n"
+            "{\"enough_information\": boolean, \"progress_note\": string}\n"
+            "If enough_information is true, progress_note should briefly state why no more tools are needed.\n"
+            "If enough_information is false, progress_note should state the next best step and why."
+        )
+        if force_progress_decision:
+            checkpoint_instruction += (
+                "\nImportant: You have reached the soft limit for consecutive tool calls. "
+                "You must provide a clear progress decision about how to proceed."
+            )
+
+        checkpoint_messages = list(messages)
+        checkpoint_messages.append({"role": "system", "content": checkpoint_instruction})
+
+        checkpoint_settings = dict(settings_payload)
+        checkpoint_settings.pop("tools", None)
+        checkpoint_settings.pop("tool_choice", None)
+        raw_max_tokens = checkpoint_settings.get("max_tokens", 256)
+        try:
+            max_tokens_val = int(raw_max_tokens) if raw_max_tokens is not None else 256
+        except Exception:
+            max_tokens_val = 256
+        checkpoint_settings["max_tokens"] = max(120, min(360, max_tokens_val))
+        checkpoint_settings["temperature"] = 0.0
+        checkpoint_settings["top_p"] = 1.0
+
+        try:
+            response = await self._chat_completion_once(
+                session=session,
+                conversation=conversation,
+                model=model,
+                messages=checkpoint_messages,
+                settings_payload=checkpoint_settings,
+            )
+            choice = (response.get("choices") or [{}])[0]
+            message = choice.get("message") or {}
+            raw = self._extract_assistant_content(choice, message).strip()
+            parsed = self._safe_json_parse(raw)
+            if isinstance(parsed, dict):
+                enough_information = bool(parsed.get("enough_information", False))
+                progress_note = str(parsed.get("progress_note", "")).strip()
+                return (enough_information, progress_note)
+        except Exception as e:
+            logger.warning("Tool-loop checkpoint failed; continuing tool flow: %s", e)
+
+        # Safe fallback: do not prematurely stop tools when checkpoint fails.
+        return (False, "")
+
+    async def _generate_final_response_without_tools(
+        self,
+        session: aiohttp.ClientSession,
+        model: str,
+        messages: list[dict],
+        settings_payload: dict,
+        conversation: Conversation,
+    ) -> str:
+        """Force one final answer turn with tools disabled."""
+        final_instruction = (
+            "You now have enough information. Provide the final user-facing answer now. "
+            "Do not call tools. Be concise and actionable."
+        )
+        final_messages = list(messages)
+        final_messages.append({"role": "system", "content": final_instruction})
+
+        final_settings = dict(settings_payload)
+        final_settings.pop("tools", None)
+        final_settings.pop("tool_choice", None)
+
+        response = await self._chat_completion_once(
+            session=session,
+            conversation=conversation,
+            model=model,
+            messages=final_messages,
+            settings_payload=final_settings,
+        )
+        choice = (response.get("choices") or [{}])[0]
+        message = choice.get("message") or {}
+        return self._extract_assistant_content(choice, message).strip()
 
     async def count_tokens(self, text: str, model: Optional[str] = None) -> int:
         """Count tokens using the configured tokenizer.
@@ -799,6 +977,75 @@ class LMStudioClient:
                 raise LMStudioError(f"API error {resp.status}: {error_text}")
             return await resp.json()
 
+    async def _chat_completion_stream_text_once(
+        self,
+        session: aiohttp.ClientSession,
+        model: str,
+        messages: list[dict],
+        settings_payload: dict,
+        conversation: Optional[Conversation] = None,
+        on_text_delta: Optional[Callable[[str], None]] = None,
+    ) -> tuple[str, str]:
+        """Issue one streaming completion request and return (content, finish_reason)."""
+        payload = {
+            "model": model,
+            "messages": self._normalize_messages(messages),
+            "stream": True,
+            **settings_payload,
+        }
+        if conversation:
+            payload["session_id"] = conversation.id
+
+        parts: list[str] = []
+        finish_reason = ""
+        if self.is_cancel_generation_requested():
+            raise GenerationCancelled(partial_text="")
+        async with session.post(
+            f"{self.endpoint}{C.API_CHAT_COMPLETIONS}",
+            json=payload,
+            timeout=aiohttp.ClientTimeout(total=C.API_TIMEOUT),
+        ) as resp:
+            if resp.status != 200:
+                error_text = await resp.text()
+                raise LMStudioError(f"API error {resp.status}: {error_text}")
+
+            while True:
+                if self.is_cancel_generation_requested():
+                    raise GenerationCancelled(partial_text="".join(parts))
+                raw_line = await resp.content.readline()
+                if not raw_line:
+                    break
+                line = raw_line.decode("utf-8", errors="ignore").strip()
+                if not line or line.startswith(":"):
+                    continue
+                if not line.startswith("data:"):
+                    continue
+
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+
+                try:
+                    chunk = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+
+                choice = (chunk.get("choices") or [{}])[0]
+                delta = choice.get("delta") or choice.get("message") or {}
+                text_delta = self._extract_stream_delta_text(choice, delta)
+                if text_delta:
+                    parts.append(text_delta)
+                    if on_text_delta is not None:
+                        try:
+                            on_text_delta(text_delta)
+                        except Exception as callback_error:
+                            logger.warning("text delta callback failed: %s", callback_error)
+                fr = choice.get("finish_reason")
+                if fr:
+                    finish_reason = str(fr)
+
+        return ("".join(parts), finish_reason)
+
     def _parse_tool_args(self, raw_args: object) -> dict:
         """Parse tool arguments JSON safely."""
         if isinstance(raw_args, dict):
@@ -838,3 +1085,22 @@ class LMStudioClient:
             return json.loads(value)
         except Exception:
             return value
+
+    def _extract_stream_delta_text(self, choice: dict, delta: object) -> str:
+        """Extract text deltas from streaming chunk variants."""
+        if isinstance(delta, dict):
+            parsed = self._content_to_text(delta.get("content"))
+            if parsed:
+                return parsed
+            parsed = self._content_to_text(delta.get("text"))
+            if parsed:
+                return parsed
+        else:
+            parsed = self._content_to_text(delta)
+            if parsed:
+                return parsed
+
+        parsed = self._content_to_text(choice.get("text"))
+        if parsed:
+            return parsed
+        return self._content_to_text(choice.get("output_text"))

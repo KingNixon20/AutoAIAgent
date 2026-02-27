@@ -164,6 +164,65 @@ separator {
   border-left: 3px solid @secondary-accent;
 }
 
+.tool-permission-bubble {
+  background-color: #2f2a1a;
+  color: @text-primary;
+  padding: 8px 12px;
+  border-radius: 12px;
+  border-left: 3px solid #f6c453;
+}
+
+.tool-permission-card {
+  background-color: rgba(246, 196, 83, 0.08);
+  border: 1px solid rgba(246, 196, 83, 0.35);
+  border-radius: 12px;
+  padding: 10px 12px;
+}
+
+.tool-permission-card-resolved {
+  background-color: rgba(88, 100, 126, 0.12);
+  border: 1px solid rgba(126, 148, 190, 0.24);
+}
+
+.tool-permission-icon {
+  color: #f6c453;
+}
+
+.tool-permission-args {
+  background-color: rgba(0, 0, 0, 0.24);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 10px;
+}
+
+.tool-permission-actions button {
+  border-radius: 999px;
+  padding: 6px 14px;
+}
+
+.tool-permission-reason-row {
+  margin-top: 2px;
+}
+
+.tool-permission-allow {
+  background-color: rgba(0, 230, 118, 0.18);
+  border: 1px solid rgba(0, 230, 118, 0.6);
+  color: #9ff2c1;
+}
+
+.tool-permission-allow:hover {
+  background-color: rgba(0, 230, 118, 0.3);
+}
+
+.tool-permission-deny {
+  background-color: rgba(255, 82, 82, 0.16);
+  border: 1px solid rgba(255, 82, 82, 0.55);
+  color: #ffb2b2;
+}
+
+.tool-permission-deny:hover {
+  background-color: rgba(255, 82, 82, 0.28);
+}
+
 .typing-indicator-bubble {
   min-height: 18px;
   padding: 8px 12px;
@@ -557,4 +616,262 @@ button.send-button-small {
   margin-top: 8px;
   padding-top: 4px;
   border-top: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+/* Chat Interface Overhaul */
+* {
+  font-family: "Inter", "Roboto", "JetBrains Sans", "Noto Sans", "Cantarell", sans-serif;
+  font-size: 13px;
+}
+
+.chat-header {
+  background: linear-gradient(180deg, rgba(22, 28, 40, 0.96), rgba(16, 20, 30, 0.96));
+  border-bottom: 1px solid rgba(126, 148, 190, 0.22);
+  padding-top: 10px;
+  padding-bottom: 10px;
+}
+
+.chat-header-title {
+  color: #e8eefb;
+}
+
+.chat-header-subtitle {
+  color: #98a6c4;
+}
+
+.conversation-scroll,
+.messages-container {
+  background: linear-gradient(180deg, #0e1118 0%, #0b0f15 100%);
+}
+
+.messages-container {
+  padding: 14px 18px;
+}
+
+.assistant-bubble {
+  background-color: rgba(42, 50, 66, 0.82);
+  border: 1px solid rgba(122, 142, 177, 0.22);
+  border-radius: 14px;
+  padding: 10px 12px;
+}
+
+.user-bubble {
+  background-color: rgba(26, 64, 98, 0.82);
+  border: 1px solid rgba(88, 168, 242, 0.33);
+  border-radius: 14px;
+  padding: 10px 12px;
+}
+
+.streaming-bubble {
+  border-color: rgba(121, 161, 255, 0.45);
+  box-shadow: 0 0 0 1px rgba(121, 161, 255, 0.12) inset;
+}
+
+.typing-indicator-bubble {
+  background-color: rgba(34, 42, 56, 0.82);
+  border: 1px solid rgba(105, 120, 154, 0.25);
+  border-radius: 12px;
+  padding: 8px 10px;
+}
+
+.markdown-view {
+  background-color: transparent;
+  color: #e5eaf4;
+}
+
+.input-container {
+  background-color: #0f131c;
+  border-top: 1px solid rgba(126, 148, 190, 0.2);
+  padding: 12px 16px;
+}
+
+.input-wrapper {
+  background-color: rgba(29, 36, 48, 0.94);
+  border: 1px solid rgba(119, 138, 171, 0.28);
+  border-radius: 14px;
+  padding: 8px;
+}
+
+.input-wrapper textview {
+  background-color: transparent;
+  border: none;
+  color: #f0f4ff;
+}
+
+.model-status-bar {
+  background-color: rgba(24, 30, 42, 0.96);
+  border: 1px solid rgba(110, 129, 164, 0.25);
+  border-radius: 10px;
+  padding: 6px 10px;
+}
+
+.message-actions {
+  opacity: 0.58;
+}
+
+.message-action-button:hover {
+  background-color: rgba(137, 156, 193, 0.18);
+}
+
+/* VS Code-like palette alignment */
+window {
+  background-color: #1e1e1e;
+  color: #d4d4d4;
+}
+
+.sidebar,
+.tools-side-panel {
+  background-color: #252526;
+  border-color: #2d2d30;
+}
+
+.chat-center-panel {
+  background-color: #1e1e1e;
+  border-left: 1px solid #2d2d30;
+  border-right: 1px solid #2d2d30;
+}
+
+.chat-main-area,
+.conversation-scroll,
+.messages-container {
+  background: #1e1e1e;
+}
+
+.chat-header {
+  background: #252526;
+  border-bottom: 1px solid #2d2d30;
+}
+
+.chat-header-title {
+  color: #cccccc;
+}
+
+.chat-header-subtitle {
+  color: #9da3ad;
+}
+
+.assistant-bubble {
+  background-color: #252526;
+  border: 1px solid #2d2d30;
+}
+
+.user-bubble {
+  background-color: #2a2d2e;
+  border: 1px solid #3a3d41;
+}
+
+.typing-indicator-bubble {
+  background-color: #252526;
+  border: 1px solid #2d2d30;
+}
+
+.streaming-bubble {
+  border-color: #3b6ea8;
+  box-shadow: 0 0 0 1px rgba(55, 148, 255, 0.15) inset;
+}
+
+.input-container {
+  background-color: #252526;
+  border-top: 1px solid #2d2d30;
+}
+
+.input-wrapper {
+  background-color: #1f1f1f;
+  border: 1px solid #3c3c3c;
+}
+
+.input-wrapper .chat-input-scroll,
+.input-wrapper .chat-input-scroll viewport,
+.input-wrapper .chat-input-scroll undershoot,
+.input-wrapper .chat-input-scroll overshoot {
+  background-color: transparent;
+  border: none;
+}
+
+.input-wrapper .chat-input-text,
+.input-wrapper .chat-input-text text {
+  background-color: transparent;
+  border: none;
+  box-shadow: none;
+  color: #f0f4ff;
+}
+
+.model-status-bar {
+  background-color: #1f1f1f;
+  border: 1px solid #3c3c3c;
+}
+
+.conversation-item.active {
+  background-color: rgba(55, 148, 255, 0.16);
+  border-left-color: #3794ff;
+}
+
+button.primary {
+  background-color: #0e639c;
+  color: #ffffff;
+}
+
+button.primary:hover {
+  background-color: #1177bb;
+}
+
+button.stop-button {
+  background-color: #b84545;
+  color: #ffffff;
+  border: 1px solid #d26767;
+}
+
+button.stop-button:hover {
+  background-color: #cb5454;
+}
+
+paned > separator {
+  background-color: #2d2d30;
+}
+
+/* Blue accents for links, paths, and file-like strings in labels */
+label link,
+.markdown-view link {
+  color: #3794ff;
+}
+
+/* Diff / Change badge */
+.change-badge-card {
+  background-color: rgba(22, 25, 31, 0.78);
+  border: 1px solid rgba(126, 136, 153, 0.24);
+  border-radius: 10px;
+  padding: 8px 10px;
+  box-shadow: 0 8px 18px rgba(0, 0, 0, 0.22);
+}
+
+.change-badge-header {
+  margin-bottom: 6px;
+}
+
+.change-badge-action {
+  color: #8590a7;
+}
+
+.change-badge-rows {
+  margin-top: 1px;
+}
+
+.change-badge-row {
+  padding: 2px 0;
+}
+
+/* Agent progress/activity rendering */
+.agent-activity-section {
+  background-color: rgba(20, 27, 36, 0.7);
+  border: 1px solid rgba(118, 140, 173, 0.26);
+  border-radius: 10px;
+  padding: 8px 10px;
+  margin-top: 4px;
+}
+
+.agent-activity-entry {
+  background-color: rgba(10, 15, 24, 0.34);
+  border: 1px solid rgba(120, 138, 170, 0.18);
+  border-radius: 8px;
+  padding: 7px 8px;
 }

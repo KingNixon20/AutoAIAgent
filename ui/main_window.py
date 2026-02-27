@@ -2,6 +2,7 @@
 Main application window orchestrating all UI components.
 """
 import constants as C
+from concurrent.futures import CancelledError as FuturesCancelledError
 from ui.components import (
     ChatArea,
     ChatInput,
@@ -23,9 +24,8 @@ from storage import (
     load_settings,
     save_settings,
 )
-from api import LMStudioClient
+from api import LMStudioClient, GenerationCancelled
 from models import Message, MessageRole, Conversation, ConversationSettings
-from copy import deepcopy
 from gi.repository import Gtk, Gio, GLib, Gdk
 import logging
 import threading
@@ -38,6 +38,8 @@ import os
 import json
 import shlex
 import difflib # Added for diff generation
+import hashlib
+import time
 from datetime import datetime
 from token_counter import count_text_tokens
 from project_map import refresh_project_map
@@ -172,6 +174,15 @@ class MainWindow(Gtk.ApplicationWindow):
         self._agent_running_conversations: set[str] = set()
         self._agent_stop_requests: set[str] = set()
         self._agent_state_lock = threading.Lock()
+        self._generation_state_lock = threading.Lock()
+        self._generation_active = False
+        self._active_generation_conversation_id: Optional[str] = None
+        self._active_generation_mode: Optional[str] = None
+        self._active_generation_future = None
+        self._pending_tool_permissions: dict[str, dict] = {}
+        self._pending_tool_permissions_lock = threading.Lock()
+        self._file_context_cache: dict[str, dict] = {}
+        self._file_context_cache_max_age_sec = 30.0
 
         # Create layout: a resizable split between sidebar and chat center
         main_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
@@ -188,6 +199,7 @@ class MainWindow(Gtk.ApplicationWindow):
         # Center: Chat area - constrain width for improved readability
         center_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         self.center_box = center_box
+        center_box.get_style_context().add_class("chat-center-panel")
         center_box.set_homogeneous(False)
         # Set minimum width so content doesn't get pushed under the left panel
         # 450px provides enough room for readable chat messages
@@ -198,7 +210,11 @@ class MainWindow(Gtk.ApplicationWindow):
             on_repush_message_request=self._on_repush_message,
             on_delete_message_request=self._on_delete_message,
             on_message_edited_request=self._on_message_edited,
+            on_tool_permission_decision_request=self._on_tool_permission_decision,
         )
+        self.chat_area.get_style_context().add_class("chat-main-area")
+        self.chat_area.set_margin_start(1)
+        self.chat_area.set_margin_end(1)
         # Ensure chat area has minimum width for readability
         self.chat_area.set_size_request(450, -1)
         self.chat_area.on_chat_settings_changed = self._on_chat_settings_changed
@@ -210,6 +226,8 @@ class MainWindow(Gtk.ApplicationWindow):
         self.chat_input.connect_send(self._on_send_message)
         self.chat_input.connect_mode_changed(self._on_chat_mode_changed)
         self.chat_input.connect_refresh(self._on_refresh_connection)
+        self.chat_input.connect_autoscroll_changed(self._on_autoscroll_toggled)
+        self.chat_area.set_autoscroll_enabled(self.chat_input.is_autoscroll_enabled())
         # Compatibility: ensure chat_input has `update_connection_status` alias
         if not hasattr(self.chat_input, "update_connection_status") and hasattr(self.chat_input, "set_model_status"):
             setattr(self.chat_input, "update_connection_status", self.chat_input.set_model_status)
@@ -775,19 +793,14 @@ class MainWindow(Gtk.ApplicationWindow):
 
     def _on_refresh_connection(self, _button) -> None:
         """Handle refresh button click in chat input to re-check API connection."""
-        if getattr(self, "asyncio_thread", None) and getattr(self.asyncio_thread, "loop", None) and self.asyncio_thread.loop.is_running():
-            asyncio.run_coroutine_threadsafe(
-                self._check_api_connection_and_update_status(),
-                self.asyncio_thread.loop
-            )
-        else:
-            logger.error("Asyncio loop not running for refresh connection. Cannot check API.")
-            GLib.idle_add(
-                self.chat_input.set_model_status,
-                False,
-                "Disconnected",
-                priority=GLib.PRIORITY_DEFAULT,
-            )
+        GLib.idle_add(
+            lambda: asyncio.ensure_future(self._check_api_connection_and_update_status()),
+            priority=GLib.PRIORITY_DEFAULT,
+        )
+
+    def _on_autoscroll_toggled(self, _button) -> None:
+        """Apply autoscroll checkbox state to chat area sticky follow behavior."""
+        self.chat_area.set_autoscroll_enabled(self.chat_input.is_autoscroll_enabled())
     
     def _on_edit_message(self, message_id: str) -> None:
         """Handle request to edit a message (from MessageBubble)."""
@@ -846,6 +859,9 @@ class MainWindow(Gtk.ApplicationWindow):
         """Regenerates AI response starting from the message with message_id."""
         if not self.current_conversation:
             return
+        if self._is_generation_active():
+            self._request_generation_stop()
+            return
 
         # Find the message index
         message_index = -1
@@ -873,6 +889,8 @@ class MainWindow(Gtk.ApplicationWindow):
         conv = self.current_conversation
         conv_id = conv.id
         mode = conv.chat_mode
+        self.api_client.clear_cancel_generation()
+        self._set_generation_active(True, conversation_id=conv_id, mode=mode)
 
         threading.Thread(
             target=self._fetch_ai_response,
@@ -887,6 +905,10 @@ class MainWindow(Gtk.ApplicationWindow):
             button: The send button.
         """
         logger.debug("Entering _on_send_message")
+        if self._is_generation_active():
+            self._request_generation_stop()
+            logger.debug("_on_send_message: Generation active, stop requested.")
+            return
         if not self.current_conversation:
             logger.debug("_on_send_message: No current conversation.")
             return
@@ -923,11 +945,7 @@ class MainWindow(Gtk.ApplicationWindow):
             id=str(uuid.uuid4()),
             role=MessageRole.USER,
             content=text,
-            tokens=asyncio.run(
-                self.api_client.count_tokens(
-                    text, model=self.current_conversation.model
-                )
-            ),
+            tokens=count_text_tokens(text, model=self.current_conversation.model),
         )
         self.current_conversation.add_message(user_msg)
         self.chat_area.add_message(user_msg)
@@ -962,7 +980,9 @@ class MainWindow(Gtk.ApplicationWindow):
             self.chat_area.hide_typing_indicator()
             logger.debug("_on_send_message: Agent is running, hiding typing indicator and returning.")
             return
-        
+
+        self.api_client.clear_cancel_generation()
+        self._set_generation_active(True, conversation_id=conv_id, mode=mode)
         logger.debug("_on_send_message: Starting _fetch_ai_response in a new thread.")
         threading.Thread(
             target=self._fetch_ai_response,
@@ -1002,6 +1022,8 @@ class MainWindow(Gtk.ApplicationWindow):
                     conversation_id,
                     priority=GLib.PRIORITY_DEFAULT,
                 )
+                self.api_client.clear_cancel_generation()
+                self._set_generation_active(False)
                 logger.debug("_fetch_ai_response: Agent already running, returning.")
                 return
             self._set_agent_running(conversation_id, True)
@@ -1019,11 +1041,20 @@ class MainWindow(Gtk.ApplicationWindow):
                         ),
                         self.asyncio_thread.loop
                     )
+                    self._set_active_generation_future(future)
                     future.result() # Blocks until completion
                     logger.debug("_fetch_ai_response: Agent mode sequence completed in asyncio_thread.")
                 else:
                     logger.error("Asyncio loop not running in separate thread for agent mode.")
                     raise ConnectionError("Asyncio event loop is not running. Cannot run agent mode.")
+            except FuturesCancelledError:
+                logger.info("Agent mode cancelled by user for conversation %s", conversation_id)
+                GLib.idle_add(
+                    self._add_agent_progress_message,
+                    conversation_id,
+                    "Agent run stopped by user.",
+                    priority=GLib.PRIORITY_DEFAULT,
+                )
             except Exception as e:
                 logger.warning("_fetch_ai_response: Agent mode run failed (%s): %s", type(e).__name__, e)
                 GLib.idle_add(
@@ -1041,25 +1072,61 @@ class MainWindow(Gtk.ApplicationWindow):
                     conversation_id,
                     priority=GLib.PRIORITY_DEFAULT,
                 )
+                self.api_client.clear_cancel_generation()
+                self._set_generation_active(False)
+                self._clear_active_generation_future(future if 'future' in locals() else None)
             logger.debug("Exiting _fetch_ai_response (agent mode).")
             return
 
         response_text = None
+        stream_id: Optional[str] = None
         tool_events = []
         followup_message = ""
         followup_tasks: list[dict] = []
+        if mode in ("ask", "plan"):
+            stream_id = str(uuid.uuid4())
         try:
             if self.asyncio_thread.loop and self.asyncio_thread.loop.is_running():
                 logger.debug("_fetch_ai_response: Submitting _get_api_response to asyncio_thread.")
-                
+
+                stream_started = False
+
+                def _on_text_delta(delta_text: str) -> None:
+                    nonlocal stream_started
+                    if not stream_id or not delta_text:
+                        return
+                    if not stream_started:
+                        stream_started = True
+                        GLib.idle_add(
+                            self._begin_stream_for_conversation,
+                            conversation_id,
+                            stream_id,
+                            priority=GLib.PRIORITY_DEFAULT,
+                        )
+                    GLib.idle_add(
+                        self._append_stream_delta_for_conversation,
+                        conversation_id,
+                        stream_id,
+                        delta_text,
+                        priority=GLib.PRIORITY_DEFAULT,
+                    )
+
                 # Submit _get_api_response to the asyncio thread and wait for its result.
                 # asyncio.run_coroutine_threadsafe returns a Future.
                 # .result() blocks until the coroutine completes or raises an exception.
                 future = asyncio.run_coroutine_threadsafe(
-                    self._get_api_response(conversation, settings, mode=mode),
+                    self._get_api_response(
+                        conversation,
+                        settings,
+                        mode=mode,
+                        on_text_delta=_on_text_delta if stream_id else None,
+                        stream_response=bool(stream_id),
+                    ),
                     self.asyncio_thread.loop
                 )
+                self._set_active_generation_future(future)
                 response_text, tool_events, planned_tasks = future.result() # This will block until result is ready
+                self._clear_active_generation_future(future)
                 
                 logger.debug("_fetch_ai_response: _get_api_response returned from asyncio_thread. Response text length: %d", len(response_text) if response_text else 0)
                 
@@ -1075,11 +1142,39 @@ class MainWindow(Gtk.ApplicationWindow):
                         ),
                         self.asyncio_thread.loop
                     )
+                    self._set_active_generation_future(plan_review_future)
                     followup_message, followup_tasks = plan_review_future.result()
+                    self._clear_active_generation_future(plan_review_future)
                     logger.debug("_fetch_ai_response: _plan_mode_review_for_missing_info returned.")
             else:
                 logger.error("Asyncio loop not running in separate thread during _fetch_ai_response.")
                 raise ConnectionError("Asyncio event loop is not running. Cannot reach LM Studio.")
+        except FuturesCancelledError:
+            logger.info("Generation cancelled via future cancellation for conversation %s", conversation_id)
+            response_text = ""
+            planned_tasks = []
+            followup_message = ""
+            followup_tasks = []
+            if stream_id:
+                GLib.idle_add(
+                    self._end_stream_for_conversation,
+                    conversation_id,
+                    stream_id,
+                    priority=GLib.PRIORITY_DEFAULT,
+                )
+        except GenerationCancelled as e:
+            logger.info("Generation cancelled by user for conversation %s", conversation_id)
+            response_text = (e.partial_text or "").strip()
+            planned_tasks = []
+            followup_message = ""
+            followup_tasks = []
+            if stream_id:
+                GLib.idle_add(
+                    self._end_stream_for_conversation,
+                    conversation_id,
+                    stream_id,
+                    priority=GLib.PRIORITY_DEFAULT,
+                )
         except Exception as e:
             error_message = f"Failed to get AI response: {type(e).__name__} - {e}"
             logger.error(error_message) # Change to error since we're not falling back
@@ -1087,25 +1182,38 @@ class MainWindow(Gtk.ApplicationWindow):
             planned_tasks = []
             followup_message = ""
             followup_tasks = []
+            if stream_id:
+                GLib.idle_add(
+                    self._end_stream_for_conversation,
+                    conversation_id,
+                    stream_id,
+                    priority=GLib.PRIORITY_DEFAULT,
+                )
 
         if response_text is None:
             # If for some reason response_text is still None (e.g., empty API response with no error),
             # provide a generic message. This should be rare with the above change.
             response_text = "AI did not provide a response."
 
-        logger.info("Assistant: %s", response_text)
-
-        # Update UI on main thread - pass conv id so we add to correct
-        # conversation
-        logger.debug("_fetch_ai_response: Updating UI on main thread.")
-        GLib.idle_add(
-            self._add_assistant_message_and_save,
-            response_text,
-            conversation_id,
-            tool_events,
-            planned_tasks,
-            priority=GLib.PRIORITY_DEFAULT,
-        )
+        if response_text and response_text.strip():
+            logger.info("Assistant: %s", response_text)
+            # Update UI on main thread - pass conv id so we add to correct conversation
+            logger.debug("_fetch_ai_response: Updating UI on main thread.")
+            GLib.idle_add(
+                self._add_assistant_message_and_save,
+                response_text,
+                conversation_id,
+                tool_events,
+                planned_tasks,
+                stream_id,
+                priority=GLib.PRIORITY_DEFAULT,
+            )
+        else:
+            GLib.idle_add(
+                self._hide_typing_indicator_for_conversation,
+                conversation_id,
+                priority=GLib.PRIORITY_DEFAULT,
+            )
         if followup_message or followup_tasks:
             logger.debug("_fetch_ai_response: Adding plan followup.")
             GLib.idle_add(
@@ -1115,6 +1223,9 @@ class MainWindow(Gtk.ApplicationWindow):
                 followup_tasks,
                 priority=GLib.PRIORITY_DEFAULT,
             )
+        self.api_client.clear_cancel_generation()
+        self._set_generation_active(False)
+        self._clear_active_generation_future()
         logger.debug("Exiting _fetch_ai_response.")
 
     async def _get_api_response(
@@ -1122,6 +1233,8 @@ class MainWindow(Gtk.ApplicationWindow):
         conversation: Conversation,
         settings: ConversationSettings,
         mode: str = "ask",
+        on_text_delta: Optional[Callable[[str], None]] = None,
+        stream_response: bool = False,
     ) -> tuple[Optional[str], list[dict], list[dict]]:
         """Call LM Studio API with conversation context and current settings.
 
@@ -1267,12 +1380,15 @@ class MainWindow(Gtk.ApplicationWindow):
                     tool_executor=lambda name, args: self._execute_tool_call_with_approval(
                         name,
                         args,
+                        conversation_id=conversation.id,
                         settings=current_settings,
                         mcp_tool_map=mcp_tool_map,
                         server_configs=server_configs,
                         on_tool_event=ev_collector, # Pass the collector function
                     ),
                     on_tool_event=lambda ev: tool_events.append(ev),
+                    on_text_delta=on_text_delta,
+                    stream_response=stream_response,
                 )
                 # Success: break out of retry loop
                 last_exc = None
@@ -1330,119 +1446,56 @@ class MainWindow(Gtk.ApplicationWindow):
                     GLib.idle_add(self.chat_input.set_model_status, False, "Disconnected", priority=GLib.PRIORITY_DEFAULT)
                     raise
 
-    def _normalize_tool_path_args_for_display_and_execution(self, tool_name: str, args: dict) -> tuple[dict, dict]:
-        """
-        Normalizes path arguments for file-related tool calls.
-        Returns two dictionaries:
-        1. `display_args`: arguments with paths resolved to absolute for UI display.
-        2. `exec_args`: arguments with paths resolved to safe relative for tool execution.
-        """
-        # A map of tool names to the key of their path argument.
-        # Handles single paths and lists of paths.
-        PATH_ARG_MAP = {
-            "builtin_read_file": "path",
-            "builtin_write_file": "path",
-            "builtin_edit_file": "path",
-            "builtin_delete_file": "path",
-            "list_files": "path", # from _tool_list_files
-            "read_file": "path",  # from _tool_read_file
-            "search_text": "path", # from _tool_search_text
-            "summarize_file_for_index": "path",
-            "load_files_into_context": "paths", # This one is a list
-            "update_project_index": "file_path",
-        }
-
-        exec_args = deepcopy(args) # Use deepcopy to avoid modifying original dict too early
-        display_args = deepcopy(args)
-
-        path_arg_key = PATH_ARG_MAP.get(tool_name)
-        if not path_arg_key or path_arg_key not in args:
-            return display_args, exec_args
-
-        workspace_root = self._get_workspace_root()
-        real_workspace_root = os.path.realpath(workspace_root)
-
-        def normalize_for_display(p: str) -> str:
-            if not isinstance(p, str) or not p.strip():
-                return p
-            p = p.strip()
-            intended_abs_path = os.path.abspath(os.path.join(workspace_root, p))
-            real_abs_path = os.path.realpath(intended_abs_path)
-            if real_abs_path.startswith(real_workspace_root):
-                return real_abs_path
-            return f"[UNSAFE PATH: {p}]"
-
-        def normalize_for_execution(p: str) -> str:
-            if not isinstance(p, str) or not p.strip():
-                return p
-            p = p.strip()
-            if os.path.isabs(p):
-                intended_abs_path = os.path.abspath(os.path.join(workspace_root, p))
-                real_abs_path = os.path.realpath(intended_abs_path)
-                if real_abs_path.startswith(real_workspace_root):
-                    return os.path.relpath(real_abs_path, real_workspace_root)
-            return p # If relative, or unsafe absolute, pass as-is for _safe_path to handle
-
-        if path_arg_key == "paths": # Handle list of paths
-            if isinstance(args.get(path_arg_key), list):
-                display_args[path_arg_key] = [normalize_for_display(path) for path in args[path_arg_key]]
-                exec_args[path_arg_key] = [normalize_for_execution(path) for path in args[path_arg_key]]
-        else: # Handle single path
-            if path_arg_key in args:
-                display_args[path_arg_key] = normalize_for_display(args[path_arg_key])
-                exec_args[path_arg_key] = normalize_for_execution(args[path_arg_key])
-        
-        return display_args, exec_args
-
     async def _execute_tool_call_with_approval(
         self,
         tool_name: str,
         args: dict,
+        conversation_id: str,
         settings: ConversationSettings,
         mcp_tool_map: Optional[dict[str, dict]] = None,
         server_configs: Optional[dict[str, dict]] = None,
         on_tool_event: Optional[Callable[[dict], None]] = None, # Added on_tool_event
     ) -> str:
-        """Prompt user for tool permission before execution unless auto-approved."""
-        # Normalize path arguments for display in the approval dialog
-        # and for safe execution later.
-        display_args, exec_args = self._normalize_tool_path_args_for_display_and_execution(tool_name, args)
-
+        """Prompt user for tool permission inline before execution unless auto-approved."""
         if not settings.auto_tool_approval:
-            # Pass the display_args to the approval blocking dialog
-            approved, enable_auto, denial_reason = await asyncio.to_thread(
-                self._request_tool_permission_blocking, tool_name, display_args
+            approved, enable_auto, deny_reason = await self._request_tool_permission_inline(
+                tool_name=tool_name,
+                args=args,
+                conversation_id=conversation_id,
+                mcp_tool_map=mcp_tool_map,
             )
             if enable_auto:
                 settings.auto_tool_approval = True
-                if self.api_client and self.api_client.on_auto_tool_approval_changed:
-                    self.api_client.on_auto_tool_approval_changed(True)
-
+                GLib.idle_add(lambda: self.settings_window.set_auto_tool_approval(True) or False)
             if not approved:
                 error_message = "Tool execution rejected by user."
-                if denial_reason:
-                    error_message = f"Tool execution denied by user with reason: {denial_reason}"
-                
+                if deny_reason:
+                    error_message = f"{error_message} Reason: {deny_reason}"
                 tool_event = {
                     "name": tool_name,
-                    "args": display_args, # Use display_args for logging/feedback to show what user saw
+                    "args": args,
                     "status": "error",
                     "result": {"ok": False, "error": error_message},
                     "details": {"type": "tool_error", "message": error_message}
                 }
                 if on_tool_event:
                     on_tool_event(tool_event)
-                
-                # Add a system message to inform the AI about the denial
-                if self.current_conversation:
-                    denial_message = f"Tool call '{tool_name}' was denied by the user. Reason: {denial_reason or 'No reason provided.'}"
-                    self._add_system_message_and_save(denial_message, self.current_conversation.id)
-
                 return json.dumps(tool_event["result"], ensure_ascii=False)
+        else:
+            meta = self._tool_permission_metadata(tool_name, args, mcp_tool_map=mcp_tool_map)
+            GLib.idle_add(
+                self._add_auto_tool_notice_message,
+                conversation_id,
+                meta["tool_name"],
+                meta["tool_description"],
+                meta["explanation"],
+                meta["args_preview"],
+                priority=GLib.PRIORITY_DEFAULT,
+            )
         
         json_result, tool_event = await self._execute_tool_call(
             tool_name,
-            exec_args, # Use exec_args here for actual execution
+            args,
             mcp_tool_map=mcp_tool_map,
             server_configs=server_configs,
         )
@@ -1450,130 +1503,249 @@ class MainWindow(Gtk.ApplicationWindow):
             on_tool_event(tool_event)
         return json_result
 
-    def _request_tool_permission_blocking(self, tool_name: str, args: dict) -> tuple[bool, bool, Optional[str]]:
-        """Show a blocking permission dialog on the GTK thread.
-
-        Returns:
-            (approved, enable_auto, denial_reason)
-        """
-        done = threading.Event()
-        result = {"approved": False, "enable_auto": False, "reason": None} # Initialize with reason
-
-        def _show_dialog() -> bool:
-            dialog = Gtk.Dialog(
-                title="Tool Permission Required",
-                transient_for=self,
-                flags=0,
-            )
-            dialog.set_modal(True)
-            dialog.add_button("Deny", Gtk.ResponseType.CANCEL)
-            dialog.add_button("Approve", Gtk.ResponseType.OK)
-            dialog.add_button("Approve + Auto", Gtk.ResponseType.APPLY)
-
-            def on_deny_with_reason(btn):
-                """Show a transient dialog to collect the reason, then close main dialog."""
-                reason_dialog = Gtk.Dialog(
-                    title="Reason for Denial",
-                    transient_for=dialog,
-                    flags=0,
-                )
-                reason_dialog.add_buttons(
-                    "Cancel", Gtk.ResponseType.CANCEL,
-                    "Submit", Gtk.ResponseType.OK,
-                )
-                reason_dialog.set_default_size(400, 150)
-
-                # Add an entry field
-                entry = Gtk.Entry()
-                entry.set_activates_default(True)
-                reason_dialog.get_content_area().pack_start(entry, False, False, 0)
-                reason_dialog.show_all()
-
-                resp = reason_dialog.run()
-                reason_text = entry.get_text().strip() if resp == Gtk.ResponseType.OK else ""
-                reason_dialog.destroy()
-
-                if resp == Gtk.ResponseType.OK and reason_text:
-                    # Store the reason
-                    result["reason"] = reason_text
-
-                    # Close the main dialog with REJECT to indicate denial with reason
-                    dialog.response(Gtk.ResponseType.REJECT)
-                # If cancelled, do nothing – user stays in the main dialog
-
-            deny_with_reason_btn = Gtk.Button(label="Deny with Reason")
-            deny_with_reason_btn.connect("clicked", on_deny_with_reason)
-            dialog.add_action_widget(deny_with_reason_btn, Gtk.ResponseType.REJECT) # Use REJECT response for deny_with_reason
-
-            dialog.set_default_response(Gtk.ResponseType.OK)
-            dialog.set_default_size(620, 360)
-
-            area = dialog.get_content_area()
-            area.set_spacing(8)
-            area.set_margin_start(12)
-            area.set_margin_end(12)
-            area.set_margin_top(12)
-            area.set_margin_bottom(12)
-
-            title = Gtk.Label()
-            title.set_xalign(0.0)
-            title.set_markup(
-                f"<b>The AI wants to run tool:</b> <tt>{GLib.markup_escape_text(str(tool_name))}</tt>"
-            )
-            area.pack_start(title, False, False, 0)
-
-            args_label = Gtk.Label(label="Arguments:")
-            args_label.set_xalign(0.0)
-            area.pack_start(args_label, False, False, 0)
-
-            args_view = Gtk.TextView()
-            args_view.set_editable(False)
-            args_view.set_cursor_visible(False)
-            args_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
-            args_text = json.dumps(args or {}, indent=2, ensure_ascii=False)
-            if len(args_text) > 8000:
-                args_text = args_text[:8000] + "\n... [truncated]"
-            args_view.get_buffer().set_text(args_text, -1)
-
-            args_scroll = Gtk.ScrolledWindow()
-            args_scroll.set_hexpand(True)
-            args_scroll.set_vexpand(True)
-            args_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-            args_scroll.add(args_view)
-            area.pack_start(args_scroll, True, True, 0)
-
-            dialog.show_all()
-            response = dialog.run()
-            dialog.destroy()
-
-            if response == Gtk.ResponseType.OK:
-                result["approved"] = True
-            elif response == Gtk.ResponseType.APPLY:
-                result["approved"] = True
-                result["enable_auto"] = True
-            elif response == Gtk.ResponseType.REJECT: # Handle explicit REJECT from deny_with_reason
-                result["approved"] = False
-            done.set()
+    def _add_auto_tool_notice_message(
+        self,
+        conversation_id: str,
+        tool_name: str,
+        tool_description: str,
+        explanation: str,
+        args_preview: str,
+    ) -> bool:
+        """Append a UI-only auto-approved tool card matching regular tool-call cards."""
+        conv = self.conversations.get(conversation_id)
+        if conv is None:
             return False
 
-        GLib.idle_add(_show_dialog)
-        done.wait(timeout=600.0)
-        return (bool(result["approved"]), bool(result["enable_auto"]), result["reason"])
-
-    def _add_system_message_and_save(self, content: str, conversation_id: str) -> None:
-        """Add a system message to the conversation and save it."""
-        if conversation_id not in self.conversations:
-            return
-        conv = self.conversations[conversation_id]
-        system_msg = Message(
+        msg = Message(
             id=str(uuid.uuid4()),
             role=MessageRole.SYSTEM,
-            content=content,
+            content=f"Tool permission request: {tool_name}",
+            tokens=0,
+            meta={
+                "ui_only": True,
+                "type": "tool_permission_request",
+                "tool_name": tool_name,
+                "tool_description": tool_description,
+                "explanation": explanation,
+                "args_preview": args_preview,
+                "decision_status": "approved",
+                "allow_always": True,
+                "deny_reason": "",
+                "auto_approved": True,
+            },
         )
-        conv.add_message(system_msg)
+        conv.add_message(msg)
+
         if self.current_conversation and self.current_conversation.id == conversation_id:
-            self.chat_area.add_message(system_msg)
+            self.current_conversation = conv
+            self.chat_area.add_message(msg)
         self._save_conversations()
+        return False
+
+    def _tool_permission_metadata(
+        self,
+        tool_name: str,
+        args: dict,
+        mcp_tool_map: Optional[dict[str, dict]] = None,
+    ) -> dict:
+        """Build display metadata for inline permission cards."""
+        description = ""
+        if isinstance(mcp_tool_map, dict):
+            meta = mcp_tool_map.get(tool_name)
+            if isinstance(meta, dict):
+                description = str(meta.get("description", "")).strip()
+
+        if not description:
+            description = "Tool execution requested by the assistant."
+
+        args_text = json.dumps(args or {}, indent=2, ensure_ascii=False)
+        if len(args_text) > 6000:
+            args_text = args_text[:6000] + "\n... [truncated]"
+
+        explanation = (
+            f"The assistant wants to run `{tool_name}` with the arguments below. "
+            "Review the request before allowing execution."
+        )
+        return {
+            "tool_name": tool_name,
+            "tool_description": description,
+            "explanation": explanation,
+            "args_preview": args_text,
+        }
+
+    async def _request_tool_permission_inline(
+        self,
+        tool_name: str,
+        args: dict,
+        conversation_id: str,
+        mcp_tool_map: Optional[dict[str, dict]] = None,
+    ) -> tuple[bool, bool, str]:
+        """Render an inline permission bubble and await the user decision."""
+        loop = asyncio.get_running_loop()
+        request_id = str(uuid.uuid4())
+        decision_future = loop.create_future()
+        meta = self._tool_permission_metadata(tool_name, args, mcp_tool_map=mcp_tool_map)
+
+        def _enqueue_card() -> bool:
+            self._add_inline_tool_permission_message(
+                request_id=request_id,
+                conversation_id=conversation_id,
+                tool_name=meta["tool_name"],
+                tool_description=meta["tool_description"],
+                explanation=meta["explanation"],
+                args_preview=meta["args_preview"],
+                decision_future=decision_future,
+                loop=loop,
+            )
+            return False
+
+        GLib.idle_add(_enqueue_card)
+
+        try:
+            decision = await asyncio.wait_for(decision_future, timeout=600.0)
+            approved = bool(decision.get("approved"))
+            allow_always = bool(decision.get("allow_always"))
+            deny_reason = str(decision.get("reason", ""))
+            return (approved, allow_always, deny_reason)
+        except asyncio.TimeoutError:
+            GLib.idle_add(
+                self._mark_tool_permission_timeout,
+                conversation_id,
+                request_id,
+                priority=GLib.PRIORITY_DEFAULT,
+            )
+            return (False, False, "Permission request timed out.")
+
+    def _add_inline_tool_permission_message(
+        self,
+        request_id: str,
+        conversation_id: str,
+        tool_name: str,
+        tool_description: str,
+        explanation: str,
+        args_preview: str,
+        decision_future: asyncio.Future,
+        loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        """Append a tool permission request to the conversation stream."""
+        conv = self.conversations.get(conversation_id)
+        if conv is None:
+            if not decision_future.done():
+                loop.call_soon_threadsafe(
+                    decision_future.set_result,
+                    {"approved": False, "allow_always": False, "reason": "Conversation not found."},
+                )
+            return
+
+        msg = Message(
+            id=request_id,
+            role=MessageRole.SYSTEM,
+            content=f"Tool permission request: {tool_name}",
+            tokens=0,
+            meta={
+                "ui_only": True,
+                "type": "tool_permission_request",
+                "tool_name": tool_name,
+                "tool_description": tool_description,
+                "explanation": explanation,
+                "args_preview": args_preview,
+                "decision_status": "pending",
+                "allow_always": False,
+                "deny_reason": "",
+            },
+        )
+        conv.add_message(msg)
+
+        if self.current_conversation and self.current_conversation.id == conversation_id:
+            self.current_conversation = conv
+            self.chat_area.add_message(msg)
+        self._save_conversations()
+
+        with self._pending_tool_permissions_lock:
+            self._pending_tool_permissions[request_id] = {
+                "conversation_id": conversation_id,
+                "future": decision_future,
+                "loop": loop,
+            }
+
+    def _mark_tool_permission_timeout(self, conversation_id: str, request_id: str) -> bool:
+        """Mark timed-out permission card as denied and disable controls."""
+        self._finalize_tool_permission_message(
+            conversation_id=conversation_id,
+            request_id=request_id,
+            status="denied",
+            allow_always=False,
+            deny_reason="No response received in time.",
+        )
+        with self._pending_tool_permissions_lock:
+            self._pending_tool_permissions.pop(request_id, None)
+        return False
+
+    def _finalize_tool_permission_message(
+        self,
+        conversation_id: str,
+        request_id: str,
+        status: str,
+        allow_always: bool,
+        deny_reason: str = "",
+    ) -> None:
+        """Persist decision state and refresh the inline permission card."""
+        conv = self.conversations.get(conversation_id)
+        if conv is None:
+            return
+
+        updated = None
+        for msg in conv.messages:
+            if msg.id != request_id:
+                continue
+            if not isinstance(msg.meta, dict):
+                msg.meta = {}
+            msg.meta["decision_status"] = status
+            msg.meta["allow_always"] = bool(allow_always)
+            msg.meta["deny_reason"] = str(deny_reason or "")
+            msg.timestamp = datetime.now()
+            updated = msg
+            break
+
+        if not updated:
+            return
+
+        if self.current_conversation and self.current_conversation.id == conversation_id:
+            self.current_conversation = conv
+            self.chat_area.replace_message_bubble(request_id, updated, animate=False)
+        self._save_conversations()
+
+    def _on_tool_permission_decision(self, message_id: str, decision: str, allow_always: bool, reason: str = "") -> None:
+        """Handle Allow/Deny clicks from inline permission cards."""
+        with self._pending_tool_permissions_lock:
+            pending = self._pending_tool_permissions.pop(message_id, None)
+        if not pending:
+            return
+
+        conversation_id = str(pending.get("conversation_id", ""))
+        approved = str(decision).strip().lower() == "approved"
+        deny_reason = ""
+        if not approved:
+            deny_reason = str(reason or "").strip() or "Denied by user."
+        self._finalize_tool_permission_message(
+            conversation_id=conversation_id,
+            request_id=message_id,
+            status="approved" if approved else "denied",
+            allow_always=bool(allow_always) if approved else False,
+            deny_reason=deny_reason,
+        )
+
+        loop = pending.get("loop")
+        future = pending.get("future")
+        if loop and future and not future.done():
+            loop.call_soon_threadsafe(
+                future.set_result,
+                {
+                    "approved": approved,
+                    "allow_always": bool(allow_always) if approved else False,
+                    "reason": deny_reason,
+                },
+            )
 
     def _add_assistant_message_and_save(
         self,
@@ -1581,17 +1753,40 @@ class MainWindow(Gtk.ApplicationWindow):
         conversation_id: str,
         tool_events: Optional[list[dict]] = None,
         planned_tasks: Optional[list[dict]] = None,
+        stream_id: Optional[str] = None,
     ) -> bool:
         """Add assistant message to UI and save (runs on main thread)."""
         if conversation_id not in self.conversations:
             return False
         conv = self.conversations[conversation_id]
+        tool_events = tool_events or []
+
+        if self._should_append_to_latest_agent_bubble(conv, response_text, tool_events, planned_tasks):
+            last_msg = conv.messages[-1]
+            previous_tokens = int(last_msg.tokens or 0)
+            existing_activity_count = self._count_agent_activity_entries(last_msg.content)
+            if not isinstance(last_msg.meta, dict):
+                last_msg.meta = {}
+            last_msg.meta["agent_activity_animate_from"] = existing_activity_count
+            last_msg.content = f"{last_msg.content.rstrip()}\n{response_text.strip()}".strip()
+            last_msg.tokens = count_text_tokens(last_msg.content, model=conv.model)
+            conv.total_tokens = max(0, int(conv.total_tokens or 0) - previous_tokens + last_msg.tokens)
+            conv.updated_at = datetime.now()
+
+            if self.current_conversation and self.current_conversation.id == conversation_id:
+                self.current_conversation = conv
+                self.chat_area.end_assistant_stream(stream_id)
+                self.chat_area.hide_typing_indicator()
+                self.chat_area.replace_message_bubble(last_msg.id, last_msg, animate=True)
+            self._save_conversations()
+            return False
+
         ai_msg = Message(
             id=str(uuid.uuid4()),
             role=MessageRole.ASSISTANT,
             content=response_text,
             tokens=count_text_tokens(response_text, model=conv.model),
-            meta={"tool_events": tool_events or []},
+            meta={"tool_events": tool_events},
         )
         conv.add_message(ai_msg)
         if planned_tasks:
@@ -1599,10 +1794,57 @@ class MainWindow(Gtk.ApplicationWindow):
             self.sidebar.set_ai_tasks(conversation_id, planned_tasks)
         if self.current_conversation and self.current_conversation.id == conversation_id:
             self.current_conversation = conv
+            self.chat_area.end_assistant_stream(stream_id)
             self.chat_area.hide_typing_indicator()
             self.chat_area.add_message(ai_msg)
         self._save_conversations()
         return False  # Don't reschedule idle
+
+    def _should_append_to_latest_agent_bubble(
+        self,
+        conv: Conversation,
+        response_text: str,
+        tool_events: list[dict],
+        planned_tasks: Optional[list[dict]],
+    ) -> bool:
+        """Return True when this assistant update should append to prior agent status bubble."""
+        if not isinstance(response_text, str) or not response_text.strip():
+            return False
+        if tool_events or planned_tasks:
+            return False
+        if not conv.messages:
+            return False
+        if conv.chat_mode != "agent":
+            return False
+
+        incoming = response_text.strip()
+        if not incoming.startswith("[Agent"):
+            return False
+
+        last_msg = conv.messages[-1]
+        if last_msg.role != MessageRole.ASSISTANT:
+            return False
+        if not isinstance(last_msg.content, str) or not last_msg.content.strip().startswith("[Agent"):
+            return False
+        last_meta = last_msg.meta if isinstance(last_msg.meta, dict) else {}
+        if last_meta.get("tool_events"):
+            return False
+        return True
+
+    def _count_agent_activity_entries(self, text: str) -> int:
+        """Count `[Agent ...]` activity entries in a combined assistant message."""
+        raw = str(text or "").strip()
+        if not raw:
+            return 0
+        chunks = re.split(r"(?=\[Agent(?:\s*-\s*[^\]]+)?\])", raw)
+        count = 0
+        for chunk in chunks:
+            item = chunk.strip()
+            if not item:
+                continue
+            if re.match(r"^\[Agent(?:\s*-\s*[^\]]+)?\]\s+.+$", item, flags=re.DOTALL):
+                count += 1
+        return count
 
     async def _run_agent_mode_sequence(
         self,
@@ -1666,8 +1908,22 @@ class MainWindow(Gtk.ApplicationWindow):
             priority=GLib.PRIORITY_DEFAULT,
         )
 
+        prompt_counter = 0
+
+        async def _post_prompt_checkpoint(note: str) -> None:
+            nonlocal prompt_counter
+            prompt_counter += 1
+            if prompt_counter % 5 != 0:
+                return
+            self._record_agent_memory_layers_checkpoint(
+                conversation_id=conversation_id,
+                project_dir=project_dir,
+                prompt_counter=prompt_counter,
+                note=note,
+            )
+
         for iteration_num, task_index in enumerate(pending_indices, start=1):
-            if self._is_agent_stop_requested(conversation_id):
+            if self._is_agent_stop_requested(conversation_id) or self.api_client.is_cancel_generation_requested():
                 GLib.idle_add(
                     self._add_agent_progress_message,
                     conversation_id,
@@ -1741,6 +1997,9 @@ class MainWindow(Gtk.ApplicationWindow):
                 global_context=global_context,
                 iteration_num=iteration_num,
             )
+            await _post_prompt_checkpoint(
+                f"Phase 1 intent validation completed for task {iteration_num}."
+            )
 
             if not validation_response.get("ok"):
                 GLib.idle_add(
@@ -1793,6 +2052,9 @@ class MainWindow(Gtk.ApplicationWindow):
                 global_context=global_context,
                 iteration_num=iteration_num,
                 validation_feedback=validation_result,
+            )
+            await _post_prompt_checkpoint(
+                f"Phase 2 design draft completed for task {iteration_num}."
             )
 
             if not design_response.get("ok"):
@@ -1872,6 +2134,9 @@ class MainWindow(Gtk.ApplicationWindow):
                     settings,
                     mode="agent",
                 )
+                await _post_prompt_checkpoint(
+                    f"Phase 3 implementation attempt {implementation_attempts} completed for task {iteration_num}."
+                )
 
                 if tool_events:
                     for event in tool_events:
@@ -1892,7 +2157,7 @@ class MainWindow(Gtk.ApplicationWindow):
                     priority=GLib.PRIORITY_DEFAULT,
                 )
                 
-                if self._is_agent_stop_requested(conversation_id):
+                if self._is_agent_stop_requested(conversation_id) or self.api_client.is_cancel_generation_requested():
                     GLib.idle_add(
                         self._add_agent_progress_message,
                         conversation_id,
@@ -1952,6 +2217,9 @@ class MainWindow(Gtk.ApplicationWindow):
                     implementation_summary=implementation_summary,
                     iteration_num=iteration_num,
                     compile_status=compile_status,
+                )
+                await _post_prompt_checkpoint(
+                    f"Phase 4 critique completed for task {iteration_num}."
                 )
 
                 if not critique_response.get("ok"):
@@ -2154,6 +2422,89 @@ class MainWindow(Gtk.ApplicationWindow):
         
         return "No specific details available."
 
+    def _record_agent_memory_layers_checkpoint(
+        self,
+        conversation_id: str,
+        project_dir: str,
+        prompt_counter: int,
+        note: str,
+    ) -> None:
+        """Persist periodic agent progress into memory layers for context retention."""
+        try:
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            safe_note = str(note or "").strip() or "Periodic agent checkpoint."
+
+            # 1) Project summary layer
+            summary_path = os.path.join(project_dir, "PROJECT_SUMMARY.md")
+            if not os.path.exists(summary_path):
+                with open(summary_path, "w", encoding="utf-8") as f:
+                    f.write("# Project Summary\n\nRolling checkpoints from agent runs.\n\n")
+            with open(summary_path, "a", encoding="utf-8") as f:
+                f.write(
+                    f"- [{ts}] Prompt #{prompt_counter}: {safe_note}\n"
+                )
+
+            # 2) Decision log layer
+            log_path = os.path.join(project_dir, "DECISION_LOG.md")
+            if not os.path.exists(log_path):
+                with open(log_path, "w", encoding="utf-8") as f:
+                    f.write("# Architectural Decision Log\n\n")
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(
+                    "\n## Agent Checkpoint\n"
+                    f"- **Date:** {ts}\n"
+                    f"- **Prompt Counter:** {prompt_counter}\n"
+                    f"- **Summary:** {safe_note}\n"
+                    "- **Status:** checkpointed\n"
+                    "\n---\n"
+                )
+
+            # 3) Project index layer
+            index_path = os.path.join(project_dir, "PROJECT_INDEX.json")
+            index_data = {}
+            if os.path.exists(index_path):
+                try:
+                    with open(index_path, "r", encoding="utf-8") as f:
+                        loaded = json.load(f)
+                    if isinstance(loaded, dict):
+                        index_data = loaded
+                except Exception:
+                    index_data = {}
+            memory_meta = index_data.get("__agent_memory__")
+            if not isinstance(memory_meta, dict):
+                memory_meta = {}
+            checkpoints = memory_meta.get("checkpoints")
+            if not isinstance(checkpoints, list):
+                checkpoints = []
+            checkpoints.append(
+                {
+                    "timestamp": ts,
+                    "prompt_counter": int(prompt_counter),
+                    "summary": safe_note,
+                }
+            )
+            memory_meta["checkpoints"] = checkpoints[-60:]
+            memory_meta["last_checkpoint_at"] = ts
+            memory_meta["last_prompt_counter"] = int(prompt_counter)
+            index_data["__agent_memory__"] = memory_meta
+            with open(index_path, "w", encoding="utf-8") as f:
+                json.dump(index_data, f, indent=2, ensure_ascii=False)
+
+            # 4) Refresh project map layer
+            try:
+                refresh_project_map(project_dir)
+            except Exception as map_err:
+                logger.debug("Project map refresh failed during checkpoint: %s", map_err)
+
+            GLib.idle_add(
+                self._add_agent_progress_message,
+                conversation_id,
+                f"Checkpointed memory layers at prompt #{prompt_counter}.",
+                priority=GLib.PRIORITY_DEFAULT,
+            )
+        except Exception as e:
+            logger.warning("Agent memory checkpoint failed: %s", e)
+
     def _on_destroy(self, _widget) -> None:
         """Called when the main window is destroyed."""
         logger.debug("MainWindow destroyed. Initiating cleanup.")
@@ -2173,7 +2524,6 @@ class MainWindow(Gtk.ApplicationWindow):
         """Asynchronous cleanup tasks for MainWindow destruction."""
         logger.debug("Running async cleanup for MainWindow.")
         storage.save_settings(self.settings)
-        self._save_conversations() # Ensure conversations are saved on shutdown
         await self.api_client.close()
         if hasattr(self.asyncio_thread, 'stop'):
             self.asyncio_thread.stop()
@@ -2237,8 +2587,104 @@ class MainWindow(Gtk.ApplicationWindow):
             self, conversation_id: str) -> bool:
         """Hide typing indicator if this conversation is active."""
         if self.current_conversation and self.current_conversation.id == conversation_id:
+            self.chat_area.end_assistant_stream()
             self.chat_area.hide_typing_indicator()
         return False
+
+    def _begin_stream_for_conversation(
+        self,
+        conversation_id: str,
+        stream_id: str,
+    ) -> bool:
+        """Start live assistant stream UI for the active conversation only."""
+        if self.current_conversation and self.current_conversation.id == conversation_id:
+            self.chat_area.begin_assistant_stream(stream_id)
+        return False
+
+    def _append_stream_delta_for_conversation(
+        self,
+        conversation_id: str,
+        stream_id: str,
+        delta_text: str,
+    ) -> bool:
+        """Append a streamed text delta to the active conversation UI."""
+        if self.current_conversation and self.current_conversation.id == conversation_id:
+            self.chat_area.append_assistant_stream(stream_id, delta_text)
+        return False
+
+    def _end_stream_for_conversation(
+        self,
+        conversation_id: str,
+        stream_id: str,
+    ) -> bool:
+        """End live assistant stream UI for the active conversation only."""
+        if self.current_conversation and self.current_conversation.id == conversation_id:
+            self.chat_area.end_assistant_stream(stream_id)
+        return False
+
+    def _set_generation_active(
+        self,
+        active: bool,
+        conversation_id: Optional[str] = None,
+        mode: Optional[str] = None,
+    ) -> None:
+        """Set global generation state and synchronize Send/Stop button UI."""
+        with self._generation_state_lock:
+            self._generation_active = bool(active)
+            if active:
+                self._active_generation_conversation_id = conversation_id
+                self._active_generation_mode = mode
+            else:
+                self._active_generation_conversation_id = None
+                self._active_generation_mode = None
+        GLib.idle_add(
+            self.chat_input.set_generation_active,
+            bool(active),
+            priority=GLib.PRIORITY_DEFAULT,
+        )
+
+    def _is_generation_active(self) -> bool:
+        """Return whether any model generation is currently active."""
+        with self._generation_state_lock:
+            return bool(self._generation_active)
+
+    def _request_generation_stop(self) -> None:
+        """Handle Stop button: request cancellation of active generation."""
+        with self._generation_state_lock:
+            if not self._generation_active:
+                return
+            active_conversation_id = self._active_generation_conversation_id
+            active_mode = self._active_generation_mode
+
+        self._cancel_active_generation_future()
+        self.api_client.request_cancel_generation()
+        if active_mode == "agent" and active_conversation_id:
+            self._request_agent_stop(
+                active_conversation_id,
+                "User requested stop.",
+            )
+
+    def _set_active_generation_future(self, future) -> None:
+        """Track the currently running asyncio future for cancellation support."""
+        with self._generation_state_lock:
+            self._active_generation_future = future
+
+    def _clear_active_generation_future(self, future=None) -> None:
+        """Clear tracked generation future (optionally only if matching)."""
+        with self._generation_state_lock:
+            if future is None or self._active_generation_future is future:
+                self._active_generation_future = None
+
+    def _cancel_active_generation_future(self) -> None:
+        """Cancel currently tracked generation future if still running."""
+        with self._generation_state_lock:
+            fut = self._active_generation_future
+        if fut is None:
+            return
+        try:
+            fut.cancel()
+        except Exception as e:
+            logger.debug("Failed to cancel active generation future: %s", e)
 
     def _set_agent_running(self, conversation_id: str, running: bool) -> None:
         """Mark/unmark agent run state for a conversation."""
@@ -2362,8 +2808,14 @@ class MainWindow(Gtk.ApplicationWindow):
                 "Execute tasks sequentially, one step at a time, and prefer concrete actions.\n"
                 "Use available tools whenever they help you inspect files, edit code, run checks, or verify results.\n"
                 "When you use a tool, interpret the result and continue toward task completion.\n"
+                "After every tool call, you MUST decide whether you can answer the user. If yes, stop calling tools and produce a final response for the task.\n"
                 "Do not ask for unnecessary confirmation; proceed unless blocked by missing required information.\n"
                 "IMPORTANT: You are sandboxed to the project directory. All file system operations MUST be relative to the project directory, always provide full paths. Any attempt to access files or directories outside of the project directory will be denied.\n"
+                "Code state rules (mandatory):\n"
+                "- Files on disk are the source of truth. Never rely on conversation memory for code content.\n"
+                "- Before searching/editing/refactoring a file, call builtin_read_file for that file path.\n"
+                "- Confirm code awareness in your reasoning: \"I have loaded the latest version of this file.\"\n"
+                "- Prefer builtin_edit_file for targeted changes. Use builtin_write_file on existing files only for explicit full rewrites.\n"
                 "After each task, provide a concise progress update and what changed.\n"
                 "Saved tasks:\n"
                 f"{task_context}\n"
@@ -2693,20 +3145,32 @@ class MainWindow(Gtk.ApplicationWindow):
 
     def _ensure_agent_config(self, conversation: Conversation) -> bool:
         """Ensure per-conversation agent config exists; prompt user if missing."""
-        logger.debug("Ensuring agent config for conversation %s. Current agent_config: %s", conversation.id, conversation.agent_config)
         cfg = conversation.agent_config if isinstance(
             conversation.agent_config, dict) else {}
         project_name = str(cfg.get("project_name", "")).strip()
         project_dir = str(cfg.get("project_dir", "")).strip()
 
-        logger.debug("Checking project_dir: '%s'", project_dir)
-        if project_dir:
-            is_dir = os.path.isdir(project_dir)
-            logger.debug("os.path.isdir('%s') is %s", project_dir, is_dir)
-        
-        # If a valid project_dir is already set, we're good.
-        if project_dir and os.path.isdir(project_dir):
-            logger.debug("Valid project_dir found, skipping dialog.")
+        # Generate default project_dir if not set
+        if not project_dir:
+            # New unique directory for this conversation's agent memory
+            default_project_dir = os.path.join(
+                storage._get_config_dir(), "agent_workspaces", conversation.id
+            )
+            os.makedirs(default_project_dir, exist_ok=True)
+            project_dir = default_project_dir
+            # Initialize agent_config if it was None
+            if conversation.agent_config is None:
+                conversation.agent_config = {}
+            conversation.agent_config["project_dir"] = project_dir
+            self._save_conversations() # Save the new project_dir
+
+        # Initialize memory files if they don't exist
+        self._initialize_agent_memory_files(project_dir)
+
+        # Pre-check: if a project name is also set (either loaded or by default) and directory exists,
+        # we can skip the dialog. User can still re-enter config via settings panel.
+        if project_name and os.path.isdir(project_dir): # Check after potential auto-creation
+            return True
 
         # Existing dialog code (if project_name or dir is still missing, or user wants to change)
         dialog = Gtk.Dialog(
@@ -3285,6 +3749,64 @@ class MainWindow(Gtk.ApplicationWindow):
         cleaned = re.sub(r"[^a-zA-Z0-9_-]", "_", value)
         return cleaned[:64] if cleaned else "tool"
 
+    def _normalize_file_cache_key(self, rel_path: str) -> str:
+        """Normalize a workspace-relative path to a stable lowercase cache key."""
+        normalized = os.path.normpath(str(rel_path or "").strip().replace("\\", "/"))
+        return normalized.lower()
+
+    def _content_hash(self, content: str) -> str:
+        return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+    def _cache_file_context(
+        self,
+        rel_path: str,
+        content: str,
+        *,
+        from_disk: bool,
+        target_path: Optional[str] = None,
+    ) -> dict:
+        """Store file context cache entry and return it."""
+        key = self._normalize_file_cache_key(rel_path)
+        entry = {
+            "path": str(rel_path),
+            "content_hash": self._content_hash(content),
+            "last_read_ts": float(time.time()),
+            "content": content,
+            "from_disk": bool(from_disk),
+        }
+        if target_path and os.path.isfile(target_path):
+            try:
+                entry["mtime"] = float(os.path.getmtime(target_path))
+            except Exception:
+                pass
+        self._file_context_cache[key] = entry
+        return entry
+
+    def _is_file_context_cache_fresh(self, rel_path: str, target_path: Optional[str]) -> bool:
+        """Return True when cached file context is fresh enough to reuse."""
+        key = self._normalize_file_cache_key(rel_path)
+        entry = self._file_context_cache.get(key)
+        if not isinstance(entry, dict):
+            return False
+        age_sec = float(time.time()) - float(entry.get("last_read_ts", 0.0))
+        if age_sec > float(self._file_context_cache_max_age_sec):
+            return False
+        if target_path and os.path.isfile(target_path):
+            cached_mtime = entry.get("mtime")
+            if cached_mtime is None:
+                return False
+            try:
+                current_mtime = float(os.path.getmtime(target_path))
+            except Exception:
+                return False
+            if abs(current_mtime - float(cached_mtime)) > 1e-6:
+                return False
+        return isinstance(entry.get("content"), str)
+
+    def _drop_file_context_cache(self, rel_path: str) -> None:
+        key = self._normalize_file_cache_key(rel_path)
+        self._file_context_cache.pop(key, None)
+
     async def _execute_tool_call(
         self,
         tool_name: str,
@@ -3557,7 +4079,7 @@ class MainWindow(Gtk.ApplicationWindow):
                 "type": "function",
                 "function": {
                     "name": "builtin_read_file",
-                    "description": "Read a UTF-8 text file inside the workspace.",
+                    "description": "Read a UTF-8 text file inside the workspace. Use this before analyzing or editing a file.",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -3572,12 +4094,14 @@ class MainWindow(Gtk.ApplicationWindow):
                 "type": "function",
                 "function": {
                     "name": "builtin_write_file",
-                    "description": "Write/overwrite a UTF-8 text file inside the workspace.",
+                    "description": "Write UTF-8 text file content inside the workspace. For existing files, this is for explicit full rewrites only.",
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "path": {"type": "string", "description": "Workspace-relative file path (e.g., 'src/main.py'). Must not be empty, absolute, or contain '..'."},
                             "content": {"type": "string", "description": "Full file content to write."},
+                            "force_overwrite": {"type": "boolean", "description": "Required true to overwrite an existing file with full new content."},
+                            "expected_hash": {"type": "string", "description": "Optional SHA-256 hash of the last loaded file content to prevent stale overwrites."},
                         },
                         "required": ["path", "content"],
                     },
@@ -3595,6 +4119,7 @@ class MainWindow(Gtk.ApplicationWindow):
                             "find": {"type": "string", "description": "Exact text to find."},
                             "replace": {"type": "string", "description": "Replacement text."},
                             "replace_all": {"type": "boolean", "description": "Replace all occurrences."},
+                            "expected_hash": {"type": "string", "description": "Optional SHA-256 hash of the last loaded file content to prevent stale edits."},
                         },
                         "required": ["path", "find", "replace"],
                     },
@@ -3631,10 +4156,12 @@ class MainWindow(Gtk.ApplicationWindow):
             integration_id = tool.get(
                 "integration_id") or tool.get("x-integration-id")
             raw_name = tool.get("x-mcp-tool-name")
+            description = str(fn.get("description", "")).strip()
             if integration_id:
                 out[fn_name] = {
                     "integration_id": str(integration_id),
                     "mcp_tool_name": str(raw_name) if raw_name is not None else fn_name,
+                    "description": description,
                 }
         return out
 
@@ -3679,15 +4206,24 @@ class MainWindow(Gtk.ApplicationWindow):
             truncated = len(content) > max_chars
             if truncated:
                 content = content[:max_chars]
+            cache_entry = self._cache_file_context(
+                rel_path=rel_path,
+                content=content,
+                from_disk=True,
+                target_path=target,
+            )
             return {
                 "ok": True,
                 "path": rel_path,
                 "content": content,
                 "truncated": truncated,
                 "max_chars": max_chars,
+                "content_hash": cache_entry.get("content_hash"),
+                "last_read_ts": cache_entry.get("last_read_ts"),
                 "details": {
                     "type": "file_read",
                     "path": rel_path,
+                    "content_hash": cache_entry.get("content_hash"),
                     "content_preview": content[:200] # first 200 chars for preview
                 }
             }
@@ -3780,6 +4316,8 @@ class MainWindow(Gtk.ApplicationWindow):
     async def _tool_builtin_read_file(self, args: dict) -> dict:
         """Built-in filesystem read file tool."""
         rel_path = str(args.get("path", "")).strip()
+        max_chars = int(args.get("max_chars", 12000))
+        max_chars = max(256, min(max_chars, 50000))
 
         if not rel_path:
             return {"ok": False, "error": "File path cannot be empty. Please provide a valid path within the project directory."}
@@ -3788,7 +4326,31 @@ class MainWindow(Gtk.ApplicationWindow):
         if ".." in rel_path or os.path.isabs(rel_path) or any(c in rel_path for c in ['<', '>', ':', '"', '|', '?', '*']):
             return {"ok": False, "error": f"Invalid characters or path traversal attempt in '{rel_path}'. Please provide a simple relative path."}
 
-        return await self._tool_read_file(args)
+        target = self._safe_path(rel_path)
+        if target and os.path.isfile(target) and self._is_file_context_cache_fresh(rel_path, target):
+            entry = self._file_context_cache.get(self._normalize_file_cache_key(rel_path), {})
+            full_content = str(entry.get("content", ""))
+            truncated = len(full_content) > max_chars
+            content = full_content[:max_chars] if truncated else full_content
+            return {
+                "ok": True,
+                "path": rel_path,
+                "content": content,
+                "truncated": truncated,
+                "max_chars": max_chars,
+                "from_cache": True,
+                "content_hash": entry.get("content_hash"),
+                "last_read_ts": entry.get("last_read_ts"),
+                "details": {
+                    "type": "file_read",
+                    "path": rel_path,
+                    "from_cache": True,
+                    "content_hash": entry.get("content_hash"),
+                    "content_preview": content[:200],
+                },
+            }
+
+        return await self._tool_read_file({"path": rel_path, "max_chars": max_chars})
 
     async def _tool_summarize_file_for_index(self, args: dict) -> dict:
         """
@@ -3976,6 +4538,8 @@ class MainWindow(Gtk.ApplicationWindow):
         """Built-in filesystem write/overwrite tool."""
         rel_path = str(args.get("path", "")).strip()
         content = str(args.get("content", ""))
+        force_overwrite = bool(args.get("force_overwrite", False))
+        expected_hash = str(args.get("expected_hash", "")).strip()
         
         if not rel_path:
             return {"ok": False, "error": "File path cannot be empty. Please provide a valid path within the project directory."}
@@ -3987,6 +4551,33 @@ class MainWindow(Gtk.ApplicationWindow):
         target = self._safe_path(rel_path)
         if not target: # _safe_path returns None if path is outside sandbox
             return {"ok": False, "error": f"Invalid or unsafe file path: '{rel_path}'. Path must be relative and within the project directory."}
+
+        existing_file = os.path.isfile(target)
+        prior_hash = None
+        read_before_write = False
+        if existing_file:
+            # Mandatory read-before-write: load latest disk-backed state first.
+            read_result = await self._tool_builtin_read_file({"path": rel_path, "max_chars": 50000})
+            if not read_result.get("ok"):
+                return {"ok": False, "error": f"Cannot overwrite existing file without loading latest content: {read_result.get('error')}"}
+            read_before_write = True
+            prior_hash = str(read_result.get("content_hash") or "")
+            if expected_hash and prior_hash and expected_hash != prior_hash:
+                return {
+                    "ok": False,
+                    "error": (
+                        f"Stale file context for '{rel_path}'. Expected hash {expected_hash} "
+                        f"but current hash is {prior_hash}. Re-read and retry."
+                    ),
+                }
+            if not force_overwrite:
+                return {
+                    "ok": False,
+                    "error": (
+                        f"Refusing full overwrite of existing file '{rel_path}' without force_overwrite=true. "
+                        "Use builtin_edit_file for targeted changes."
+                    ),
+                }
         
         try:
             parent = os.path.dirname(target)
@@ -3994,14 +4585,26 @@ class MainWindow(Gtk.ApplicationWindow):
                 os.makedirs(parent, exist_ok=True)
             with open(target, "w", encoding="utf-8") as f:
                 f.write(content)
+            cache_entry = self._cache_file_context(
+                rel_path=rel_path,
+                content=content,
+                from_disk=True,
+                target_path=target,
+            )
             return {
                 "ok": True,
                 "path": rel_path,
                 "bytes_written": len(content.encode("utf-8")),
+                "content_hash": cache_entry.get("content_hash"),
+                "last_read_ts": cache_entry.get("last_read_ts"),
+                "read_before_write": read_before_write,
+                "previous_content_hash": prior_hash,
                 "details": {
                     "type": "file_write",
                     "path": rel_path,
                     "bytes_written": len(content.encode("utf-8")),
+                    "content_hash": cache_entry.get("content_hash"),
+                    "read_before_write": read_before_write,
                     "content_preview": content[:200]
                 }
             }
@@ -4015,6 +4618,7 @@ class MainWindow(Gtk.ApplicationWindow):
         find_text = str(args.get("find", ""))
         replace_text = str(args.get("replace", ""))
         replace_all = bool(args.get("replace_all", False))
+        expected_hash = str(args.get("expected_hash", "")).strip()
 
         if not rel_path:
             return {"ok": False, "error": "File path cannot be empty. Please provide a valid path within the project directory."}
@@ -4029,8 +4633,20 @@ class MainWindow(Gtk.ApplicationWindow):
         if find_text == "":
             return {"ok": False, "error": "'find' must not be empty"}
         try:
-            with open(target, "r", encoding="utf-8", errors="replace") as f:
-                original_content = f.read()
+            # Mandatory read-before-write: always load the latest file state first.
+            read_result = await self._tool_builtin_read_file({"path": rel_path, "max_chars": 50000})
+            if not read_result.get("ok"):
+                return {"ok": False, "error": f"Cannot edit file without loading latest content: {read_result.get('error')}"}
+            original_content = str(read_result.get("content", ""))
+            prior_hash = str(read_result.get("content_hash") or "")
+            if expected_hash and prior_hash and expected_hash != prior_hash:
+                return {
+                    "ok": False,
+                    "error": (
+                        f"Stale file context for '{rel_path}'. Expected hash {expected_hash} "
+                        f"but current hash is {prior_hash}. Re-read and retry."
+                    ),
+                }
             count = original_content.count(find_text)
             if count == 0:
                 return {"ok": False, "error": "Text to replace was not found"}
@@ -4043,6 +4659,12 @@ class MainWindow(Gtk.ApplicationWindow):
             # Write updated content
             with open(target, "w", encoding="utf-8") as f:
                 f.write(updated_content)
+            cache_entry = self._cache_file_context(
+                rel_path=rel_path,
+                content=updated_content,
+                from_disk=True,
+                target_path=target,
+            )
 
             diff = list(difflib.unified_diff(
                 original_content.splitlines(keepends=True),
@@ -4056,9 +4678,15 @@ class MainWindow(Gtk.ApplicationWindow):
                 "ok": True,
                 "path": rel_path,
                 "replacements": replaced,
+                "content_hash": cache_entry.get("content_hash"),
+                "last_read_ts": cache_entry.get("last_read_ts"),
+                "previous_content_hash": prior_hash,
+                "read_before_edit": True,
                 "details": {
                     "type": "file_edit",
                     "path": rel_path,
+                    "content_hash": cache_entry.get("content_hash"),
+                    "read_before_edit": True,
                     "diff": "".join(diff)
                 }
             }
@@ -4085,6 +4713,7 @@ class MainWindow(Gtk.ApplicationWindow):
             return {"ok": False, "error": "Deletion rejected by user"}
         try:
             os.remove(target)
+            self._drop_file_context_cache(rel_path)
             return {"ok": True, "path": rel_path, "deleted": True}
         except Exception as e:
             return {"ok": False, "error": f"Failed to delete file: {e}"}
@@ -4315,7 +4944,8 @@ class MainWindow(Gtk.ApplicationWindow):
         if not os.path.isdir(project_dir):
             return f"Project directory not found: {project_dir}"
 
-        output = [f"Project Map for: {project_dir}"]
+        project_dir_abs = os.path.abspath(project_dir)
+        output = [f"Project Map for: {project_dir_abs}"]
         ignore_patterns = ignore_patterns or [
             '__pycache__', '.git', '.venv', 'venv', 'node_modules', '*.pyc', '*.bak', '*.swp',
             '*.log', 'tmp', '.DS_Store', 'Thumbs.db'
@@ -4330,8 +4960,8 @@ class MainWindow(Gtk.ApplicationWindow):
                     return True
             return False
 
-        for root, dirs, files in os.walk(project_dir):
-            rel_path = os.path.relpath(root, project_dir)
+        for root, dirs, files in os.walk(project_dir_abs):
+            rel_path = os.path.relpath(root, project_dir_abs)
             if rel_path == ".":
                 level = 0
             else:
@@ -4346,34 +4976,35 @@ class MainWindow(Gtk.ApplicationWindow):
 
             indent = "  " * level
             if level == 0:
-                output.append(f"{indent}.")
+                output.append(f"{indent}{project_dir_abs}/")
             else:
-                output.append(f"{indent}{os.path.basename(root)}/")
+                output.append(f"{indent}{os.path.abspath(root)}/")
             
             for f_name in files:
                 if not _should_ignore(f_name, is_dir=False):
-                    output.append(f"{indent}  {f_name}")
+                    output.append(f"{indent}  {os.path.abspath(os.path.join(root, f_name))}")
         
         return "\n".join(output)
 
     def _get_workspace_root(self) -> str:
-        """Get the effective workspace root for the current conversation."""
-        logger.debug("Calling _get_workspace_root. Current conversation: %s, chat_mode: %s", 
-                     self.current_conversation.id if self.current_conversation else "None", 
-                     self.current_conversation.chat_mode if self.current_conversation else "None")
-        if (
-            self.current_conversation
-            and self.current_conversation.chat_mode == "agent"
-            and isinstance(self.current_conversation.agent_config, dict)
-        ):
-            project_dir = str(self.current_conversation.agent_config.get("project_dir", "")).strip()
-            logger.debug("Agent mode active. Project dir from agent_config: '%s'", project_dir)
-            if project_dir:
-                is_dir = os.path.isdir(project_dir)
-                logger.debug("os.path.isdir('%s') is %s", project_dir, is_dir)
-            if project_dir and os.path.isdir(project_dir):
-                return project_dir
-        logger.debug("Returning default workspace_root: '%s'", self.workspace_root)
+        """Return the effective workspace root for the current context."""
+        # Prefer per-conversation agent project_dir when valid and not inside app code
+        if self.current_conversation:
+            if self.current_conversation.chat_mode == "agent":
+                cfg = self.current_conversation.agent_config
+                if isinstance(cfg, dict):
+                    proj_dir = str(cfg.get("project_dir", "")).strip()
+                    if proj_dir and os.path.isdir(proj_dir):
+                        try:
+                            proj_dir_abs = os.path.abspath(proj_dir)
+                            # Reject project dirs that are inside the application code
+                            app_root = getattr(self, "_app_root", os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+                            if proj_dir_abs == app_root or proj_dir_abs.startswith(app_root + os.sep):
+                                logger.warning("Ignoring agent project_dir inside app repo: %s", proj_dir_abs)
+                            else:
+                                return proj_dir_abs
+                        except Exception:
+                            pass
         return self.workspace_root
 
     def _default_model_name(self) -> str:

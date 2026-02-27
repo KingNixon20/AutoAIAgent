@@ -4,7 +4,7 @@ Chat input widget for user message composition.
 import gi
 
 gi.require_version("Gtk", "3.0")
-from gi.repository import Gtk, Gdk
+from gi.repository import Gtk, Gdk, GLib
 
 
 class ChatInput(Gtk.Box):
@@ -30,8 +30,10 @@ class ChatInput(Gtk.Box):
         scrolled.set_max_content_height(84)
         scrolled.set_vexpand(False)
         scrolled.set_hexpand(True)
+        scrolled.set_shadow_type(Gtk.ShadowType.NONE)
         scrolled.set_margin_start(0)
         scrolled.set_margin_end(0)
+        scrolled.get_style_context().add_class("chat-input-scroll")
         
         self.text_view = Gtk.TextView()
         self.text_view.set_wrap_mode(Gtk.WrapMode.WORD)
@@ -40,14 +42,17 @@ class ChatInput(Gtk.Box):
         self.text_view.set_top_margin(6)
         self.text_view.set_bottom_margin(6)
         self.text_view.set_accepts_tab(False)
+        self.text_view.get_style_context().add_class("chat-input-text")
         scrolled.add(self.text_view)
         
         input_wrapper.pack_start(scrolled, True, True, 0)
         
         # Send button - compact and properly positioned
         self.send_button = Gtk.Button(label="")
-        send_icon = Gtk.Image.new_from_icon_name("mail-send-symbolic", Gtk.IconSize.SMALL_TOOLBAR)
-        self.send_button.set_image(send_icon)
+        self._send_icon = Gtk.Image.new_from_icon_name("mail-send-symbolic", Gtk.IconSize.SMALL_TOOLBAR)
+        self._stop_icon = Gtk.Image.new_from_icon_name("process-stop-symbolic", Gtk.IconSize.SMALL_TOOLBAR)
+        self.send_button.set_image(self._send_icon)
+        self.send_button.set_tooltip_text("Send message")
         self.send_button.set_sensitive(False)
         self.send_button.set_size_request(28, 28)
         self.send_button.set_halign(Gtk.Align.END)
@@ -63,6 +68,7 @@ class ChatInput(Gtk.Box):
         # Status bar
         status_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         status_box.set_margin_top(6)
+        status_box.get_style_context().add_class("model-status-bar")
         
         # Status indicator dot
         self.status_dot = Gtk.Box()
@@ -104,6 +110,8 @@ class ChatInput(Gtk.Box):
         
         self._api_client = None
         self._refresh_callback = None
+        self._generation_active = False
+        self._state_anim_source_id = None
         
         # Autoscroll checkbox on the right side
         spacer = Gtk.Box()
@@ -125,8 +133,73 @@ class ChatInput(Gtk.Box):
 
     def _on_text_changed(self, buffer):
         """Update send button state based on text content."""
-        has_text = buffer.get_char_count() > 0
+        self._refresh_send_button_state()
+
+    def _refresh_send_button_state(self) -> None:
+        """Refresh send/stop button sensitivity from current state."""
+        if self._generation_active:
+            self.send_button.set_sensitive(True)
+            return
+        has_text = self.text_buffer.get_char_count() > 0
         self.send_button.set_sensitive(has_text)
+
+    def set_generation_active(self, active: bool) -> None:
+        """Switch send button between Send and Stop states."""
+        active = bool(active)
+        if self._generation_active == active:
+            self._refresh_send_button_state()
+            return
+        self._generation_active = active
+        self._animate_button_state_swap()
+        self._refresh_send_button_state()
+
+    def is_generation_active(self) -> bool:
+        """Return whether the input is in generating (Stop) state."""
+        return self._generation_active
+
+    def _apply_button_state_now(self) -> None:
+        """Apply the current visual state without animation."""
+        ctx = self.send_button.get_style_context()
+        if self._generation_active:
+            self.send_button.set_image(self._stop_icon)
+            self.send_button.set_tooltip_text("Stop generation")
+            ctx.remove_class("primary")
+            ctx.add_class("stop-button")
+        else:
+            self.send_button.set_image(self._send_icon)
+            self.send_button.set_tooltip_text("Send message")
+            ctx.remove_class("stop-button")
+            ctx.add_class("primary")
+
+    def _animate_button_state_swap(self) -> None:
+        """Fade button out, swap icon/style, and fade back in."""
+        if self._state_anim_source_id:
+            GLib.source_remove(self._state_anim_source_id)
+            self._state_anim_source_id = None
+
+        steps = {"value": 0}
+        total_steps = 6
+        tick_ms = 16
+
+        def _tick() -> bool:
+            steps["value"] += 1
+            progress = steps["value"] / float(total_steps)
+            if progress < 0.5:
+                self.send_button.set_opacity(max(0.0, 1.0 - (progress * 2.0)))
+            elif progress < 0.67:
+                self._apply_button_state_now()
+                self.send_button.set_opacity(0.0)
+            else:
+                self.send_button.set_opacity(min(1.0, (progress - 0.5) * 2.0))
+
+            if steps["value"] >= total_steps:
+                self.send_button.set_opacity(1.0)
+                self._apply_button_state_now()
+                self._state_anim_source_id = None
+                return False
+            return True
+
+        self._state_anim_source_id = GLib.timeout_add(tick_ms, _tick)
 
     def get_text(self) -> str:
         """Get the current input text.
@@ -212,6 +285,9 @@ class ChatInput(Gtk.Box):
         if event.state & Gdk.ModifierType.SHIFT_MASK:
             # Let TextView insert a newline.
             return False
+        if self._generation_active:
+            # Ignore Enter while generating; stop is explicit via button.
+            return True
         # Plain Enter sends message.
         if self.send_button.get_sensitive():
             self.send_button.clicked()
@@ -247,3 +323,7 @@ class ChatInput(Gtk.Box):
         """
         self._refresh_callback = callback
         self.refresh_button.connect("clicked", lambda btn: callback())
+
+    def connect_autoscroll_changed(self, callback):
+        """Connect autoscroll toggle changed signal."""
+        self.autoscroll_check.connect("toggled", callback)

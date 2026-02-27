@@ -50,13 +50,20 @@ class Conversation:
     agent_config: Optional[dict] = None  # {"project_name": str, "project_dir": str}
     active_context_files: dict[str, str] = field(default_factory=dict) # Files loaded for deep retrieval
 
+    def _is_ui_only_message(self, message: Message) -> bool:
+        """Return True for UI-only messages that should not be sent to the model."""
+        return bool(isinstance(message.meta, dict) and message.meta.get("ui_only"))
+
     def add_message(self, message: Message) -> None:
         """Add a message to the conversation."""
-        if message.tokens <= 0:
+        if self._is_ui_only_message(message):
+            message.tokens = 0
+        elif message.tokens <= 0:
             message.tokens = self._estimate_tokens(message.content, self.model)
         self.messages.append(message)
         self.updated_at = datetime.now()
-        self.total_tokens += message.tokens
+        if not self._is_ui_only_message(message):
+            self.total_tokens += message.tokens
 
     def get_last_message(self) -> Optional[Message]:
         """Get the last message in the conversation."""
@@ -71,6 +78,8 @@ class Conversation:
         target_model = model or self.model
         total = 0
         for msg in self.messages:
+            if self._is_ui_only_message(msg):
+                continue
             if msg.tokens <= 0:
                 msg.tokens = self._estimate_tokens(msg.content, target_model)
             total += msg.tokens
@@ -87,9 +96,13 @@ class Conversation:
         keeps the most recent exchanges. Never removes the system prompt
         (that is added by the caller).
         """
+        context_messages = [
+            msg for msg in self.messages
+            if not self._is_ui_only_message(msg)
+        ]
         messages = [
             {"role": msg.role.value, "content": msg.content}
-            for msg in self.messages
+            for msg in context_messages
         ]
         if max_tokens is None:
             return messages
@@ -100,9 +113,9 @@ class Conversation:
 
         # Sliding window: keep most recent exchanges, drop oldest
         total = 0
-        keep_from = len(self.messages)
-        for i in range(len(self.messages) - 1, -1, -1):
-            msg = self.messages[i]
+        keep_from = len(context_messages)
+        for i in range(len(context_messages) - 1, -1, -1):
+            msg = context_messages[i]
             tokens = msg.tokens if msg.tokens > 0 else self._estimate_tokens(msg.content, self.model)
             if total + tokens > max_tokens and total > 0:
                 keep_from = i + 1
@@ -112,7 +125,7 @@ class Conversation:
 
         return [
             {"role": msg.role.value, "content": msg.content}
-            for msg in self.messages[keep_from:]
+            for msg in context_messages[keep_from:]
         ]
 
 
@@ -134,6 +147,7 @@ class ConversationSettings:
     tools: Optional[list] = None
     tool_choice: Optional[object] = None
     integrations: Optional[list[str]] = None  # MCP server ids e.g. ["mcp/playwright"]
+    project_directory: Optional[str] = None
 
     def to_dict(self) -> dict:
         """Convert to API request parameters."""

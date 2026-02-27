@@ -32,6 +32,7 @@ def _settings_to_dict(settings: ConversationSettings) -> dict:
         "system_prompt": settings.system_prompt,
         "context_limit": settings.context_limit,
         "token_saver": settings.token_saver,
+        "project_directory": settings.project_directory,
     }
 
 def _settings_from_dict(data: dict) -> ConversationSettings:
@@ -49,6 +50,7 @@ def _settings_from_dict(data: dict) -> ConversationSettings:
         system_prompt=data.get("system_prompt", C.DEFAULT_SYSTEM_PROMPT),
         context_limit=data.get("context_limit", C.DEFAULT_CONTEXT_LIMIT),
         token_saver=data.get("token_saver", False),
+        project_directory=data.get("project_directory", None),
     )
 
 def _get_settings_path() -> str:

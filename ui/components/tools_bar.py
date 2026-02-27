@@ -162,7 +162,7 @@ class ToolsBar(Gtk.Box):
         vbox.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL, margin_top=10, margin_bottom=5), False, False, 0)
 
         # Add the critique checkbox
-        self.critique_checkbox = Gtk.CheckButton(label="Enable Self-Critique")
+        self.critique_checkbox = Gtk.CheckButton(label="Enable Self-Critique (Token Heavy)")
         self.text = "Enable this to have the Agent critique its own work and suggest improvements."
         self.critique_checkbox.set_active(True) # Enabled by default
         self.critique_checkbox.set_tooltip_text("Enable this to have the Agent critique its own work and suggest improvements.")

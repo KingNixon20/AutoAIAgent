@@ -11,7 +11,7 @@ from gi.repository import Gtk, GLib
 
 from models import Message, Conversation, ConversationSettings, MessageRole
 import constants as C
-from ui.components.message_bubble import MessageBubble, TypingIndicator
+from ui.components.message_bubble import MessageBubble, TypingIndicator, StreamingMessageBubble
 
 
 class ChatArea(Gtk.Box):
@@ -21,7 +21,8 @@ class ChatArea(Gtk.Box):
                  on_edit_message_request: Optional[Callable[[str], None]] = None,
                  on_repush_message_request: Optional[Callable[[str], None]] = None,
                  on_delete_message_request: Optional[Callable[[str], None]] = None,
-                 on_message_edited_request: Optional[Callable[[str, str], None]] = None): # New callback
+                 on_message_edited_request: Optional[Callable[[str, str], None]] = None,
+                 on_tool_permission_decision_request: Optional[Callable[[str, str, bool, str], None]] = None):
         """Initialize the chat area."""
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=0)
 
@@ -33,19 +34,26 @@ class ChatArea(Gtk.Box):
         self.on_chat_settings_changed = None
         self._global_settings_provider = None
         self._autoscroll_enabled = True
+        self._sticky_autoscroll = True
+        self._autoscroll_force = False
+        self._last_vadjustment_value = 0.0
         self._autoscroll_pulses = 0
         self._autoscroll_source_id = None
         self._last_known_container_width = 0  # Track width changes
         self._initial_layout_done = False  # Track if initial layout has been applied
+        self._active_stream_id = None
+        self._streaming_widget = None
         
         self.on_edit_message_request = on_edit_message_request
         self.on_repush_message_request = on_repush_message_request
         self.on_delete_message_request = on_delete_message_request
         self.on_message_edited_request = on_message_edited_request # Store the new callback
+        self.on_tool_permission_decision_request = on_tool_permission_decision_request
         self._on_message_edited_internal = self._handle_message_edited # Internal handler
 
         # Chat header
         self.header_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self.header_box.get_style_context().add_class("chat-header")
         self.header_box.set_size_request(-1, 64)
         self.header_box.set_margin_start(20)
         self.header_box.set_margin_end(20)
@@ -55,6 +63,7 @@ class ChatArea(Gtk.Box):
         header_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
 
         title_label = Gtk.Label(label="New Conversation")
+        title_label.get_style_context().add_class("chat-header-title")
         title_label.set_halign(Gtk.Align.START)
         title_label.set_hexpand(True)
         title_label.set_xalign(0.0)
@@ -78,6 +87,7 @@ class ChatArea(Gtk.Box):
         header_row.pack_end(self.chat_settings_btn, False, False, 0)
 
         subtitle_label = Gtk.Label(label="")
+        subtitle_label.get_style_context().add_class("chat-header-subtitle")
         subtitle_label.set_halign(Gtk.Align.START)
         subtitle_label.set_xalign(0.0)
         subtitle_label.set_markup("<span size='9000' foreground='#808080'>Loading...</span>")
@@ -98,11 +108,13 @@ class ChatArea(Gtk.Box):
         scrolled.set_hexpand(True)
         # Prevent horizontal scrolling - messages should wrap, not scroll horizontally
         scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scrolled.get_style_context().add_class("conversation-scroll")
 
         self.messages_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         self.messages_box.set_homogeneous(False)
         self.messages_box.set_hexpand(True)
         self.messages_box.set_halign(Gtk.Align.FILL)
+        self.messages_box.get_style_context().add_class("messages-container")
         # Don't set a fixed size_request - let content expand to fill available space
         # Messages will be constrained by their max-width to prevent excessive line lengths
         self.messages_box.set_size_request(-1, -1)
@@ -111,6 +123,9 @@ class ChatArea(Gtk.Box):
         self.add(scrolled)
 
         self.scrolled = scrolled
+        vadj = self.scrolled.get_vadjustment()
+        if vadj:
+            vadj.connect("value-changed", self._on_scroll_value_changed)
         self.messages_box.connect("size-allocate", self._on_messages_size_allocate)
         # Connect to ChatArea's own size-allocate to fix initial layout on app launch
         self.connect("size-allocate", self._on_chat_area_size_allocate)
@@ -127,7 +142,6 @@ class ChatArea(Gtk.Box):
         bubble = self.get_message_bubble_by_id(message_id)
         if bubble and bubble.message.role == MessageRole.USER:
             bubble.set_edit_mode(True)
-            self._autoscroll_enabled = False # Disable autoscroll while editing
 
     def _handle_message_edited(self, message_id: str, new_content: str) -> None:
         """Handles the event when a message bubble's content has been edited."""
@@ -162,10 +176,7 @@ class ChatArea(Gtk.Box):
         for child in children_to_remove:
             self.messages_box.remove(child)
         
-        # 4. Re-enable autoscroll
-        self._autoscroll_enabled = True
-
-        # 5. Trigger the re-iteration (callback to main window)
+        # 4. Trigger the re-iteration (callback to main window)
         if self.on_message_edited_request:
             self.on_message_edited_request(message_id, new_content)
         
@@ -181,7 +192,9 @@ class ChatArea(Gtk.Box):
                     .replace("<", "&lt;")
                     .replace(">", "&gt;")
                 )
-                updated_bubble.message_display_widget.set_markup(f"<span size='11000'>{escaped}</span>")
+                updated_bubble.message_display_widget.set_markup(
+                    f"<span size='11300' weight='500'>{escaped}</span>"
+                )
             # Update token count
             for child in updated_bubble.get_children():
                 if isinstance(child, Gtk.Box) and child.get_style_context().has_class("message-actions"):
@@ -210,6 +223,7 @@ class ChatArea(Gtk.Box):
             conversation: The conversation to display.
             context_limit: The context token limit for this conversation.
         """
+        self.end_assistant_stream()
         # Clear existing messages
         for child in list(self.messages_box.get_children()):
             self.messages_box.remove(child)
@@ -245,7 +259,7 @@ class ChatArea(Gtk.Box):
             self.add_message(message, animate=False)
 
         # Auto scroll to bottom
-        self._request_scroll_to_bottom(8)
+        self._request_scroll_to_bottom(8, force=True)
         
         # Schedule width fixup after initial layout - this ensures messages get correct width
         # on app launch before they're rendered
@@ -297,7 +311,9 @@ class ChatArea(Gtk.Box):
             on_repush_message=self.on_repush_message_request,
             on_delete_message=self.on_delete_message_request,
             on_message_edited=self.on_message_edited_request, # Pass the new callback
+            on_tool_permission_decision=self.on_tool_permission_decision_request,
             max_content_width=calculated_width,
+            animate=animate,
         )
         self.messages_box.add(bubble)
         bubble.show()  # Show bubble itself, not all children recursively
@@ -310,6 +326,50 @@ class ChatArea(Gtk.Box):
 
         # Auto scroll to bottom
         self._request_scroll_to_bottom(10)
+
+    def replace_message_bubble(self, message_id: str, updated_message: Message, animate: bool = False) -> bool:
+        """Replace one rendered message bubble in-place with updated content."""
+        target_bubble = None
+        target_index = -1
+        children = self.messages_box.get_children()
+        for idx, child in enumerate(children):
+            if isinstance(child, MessageBubble) and child.message.id == message_id:
+                target_bubble = child
+                target_index = idx
+                break
+
+        if target_bubble is None or target_index < 0:
+            return False
+
+        self.messages_box.remove(target_bubble)
+
+        allocated_width = self.messages_box.get_allocated_width()
+        total_horizontal_margins = 20 + 20
+        if allocated_width > 1:
+            calculated_width = allocated_width - total_horizontal_margins
+        else:
+            calculated_width = 550
+        calculated_width = min(calculated_width, C.CHAT_MAX_WIDTH)
+        if calculated_width < 400:
+            calculated_width = 400
+
+        replacement = MessageBubble(
+            updated_message,
+            on_edit_message=self.on_edit_message_request,
+            on_repush_message=self.on_repush_message_request,
+            on_delete_message=self.on_delete_message_request,
+            on_message_edited=self.on_message_edited_request,
+            on_tool_permission_decision=self.on_tool_permission_decision_request,
+            max_content_width=calculated_width,
+            animate=animate,
+        )
+        self.messages_box.add(replacement)
+        self.messages_box.reorder_child(replacement, target_index)
+        replacement.show()
+
+        self._update_subtitle()
+        self._request_scroll_to_bottom(6)
+        return True
 
     def show_typing_indicator(self) -> None:
         """Show the typing indicator."""
@@ -331,8 +391,63 @@ class ChatArea(Gtk.Box):
         self._typing_shown = False
         self._request_scroll_to_bottom(4)
 
+    def begin_assistant_stream(self, stream_id: str) -> None:
+        """Create live assistant bubble for incremental streamed text."""
+        if not stream_id:
+            return
+        self.end_assistant_stream()
+        self.hide_typing_indicator()
+
+        calculated_width = min(
+            max(400, self.messages_box.get_allocated_width() - 40),
+            C.CHAT_MAX_WIDTH,
+        )
+        bubble = StreamingMessageBubble(
+            stream_id=stream_id,
+            max_content_width=calculated_width,
+            on_text_advanced=lambda: self._request_scroll_to_bottom(2),
+            word_interval_ms=30,
+        )
+        self._active_stream_id = stream_id
+        self._streaming_widget = bubble
+        self.messages_box.add(bubble)
+        bubble.show()
+        self._request_scroll_to_bottom(8)
+
+    def append_assistant_stream(self, stream_id: str, text_delta: str) -> None:
+        """Append streamed text to the active live assistant bubble."""
+        if not text_delta:
+            return
+        if stream_id != self._active_stream_id:
+            return
+        if not self._streaming_widget:
+            return
+        self._streaming_widget.append_text(text_delta)
+        self._request_scroll_to_bottom(3)
+
+    def end_assistant_stream(self, stream_id: Optional[str] = None) -> None:
+        """End and remove live assistant stream bubble."""
+        if stream_id and stream_id != self._active_stream_id:
+            return
+        widget = self._streaming_widget
+        if widget:
+            try:
+                widget.flush()
+                widget.stop()
+            except Exception:
+                pass
+            parent = widget.get_parent()
+            if parent:
+                try:
+                    self.messages_box.remove(widget)
+                except Exception:
+                    pass
+        self._streaming_widget = None
+        self._active_stream_id = None
+
     def clear(self) -> None:
         """Clear all messages from the display."""
+        self.end_assistant_stream()
         # Stop typing indicator animation if active
         if hasattr(self, "_typing_indicator_widget"):
             if hasattr(self._typing_indicator_widget, "stop_animation"):
@@ -648,9 +763,16 @@ class ChatArea(Gtk.Box):
         for child in self.messages_box.get_children():
             if isinstance(child, MessageBubble):
                 child.update_max_content_width(new_width)
+            elif isinstance(child, StreamingMessageBubble):
+                child.update_max_content_width(new_width)
 
-    def _request_scroll_to_bottom(self, pulses: int = 6) -> None:
+    def _request_scroll_to_bottom(self, pulses: int = 6, force: bool = False) -> None:
         """Schedule repeated bottom-scroll ticks to handle delayed layout updates."""
+        if not force:
+            if not self._autoscroll_enabled or not self._sticky_autoscroll:
+                return
+        if force:
+            self._autoscroll_force = True
         if pulses > self._autoscroll_pulses:
             self._autoscroll_pulses = pulses
         if self._autoscroll_source_id is None:
@@ -658,14 +780,45 @@ class ChatArea(Gtk.Box):
 
     def _autoscroll_tick(self) -> bool:
         """Autoscroll tick; keeps following newest message until pulses exhaust."""
+        if not self._autoscroll_force:
+            if not self._autoscroll_enabled or not self._sticky_autoscroll:
+                self._autoscroll_source_id = None
+                self._autoscroll_pulses = 0
+                return False
         adj = self.scrolled.get_vadjustment()
         if adj: # Check if adjustment exists
+            self._last_vadjustment_value = adj.get_value()
             adj.set_value(adj.get_upper() - adj.get_page_size())
         self._autoscroll_pulses -= 1
         if self._autoscroll_pulses > 0:
             return True
         self._autoscroll_source_id = None
+        self._autoscroll_force = False
         return False
+
+    def set_autoscroll_enabled(self, enabled: bool) -> None:
+        """Enable/disable sticky autoscroll behavior."""
+        self._autoscroll_enabled = bool(enabled)
+        if self._autoscroll_enabled:
+            self._sticky_autoscroll = True
+            self._request_scroll_to_bottom(6, force=True)
+        else:
+            self._autoscroll_force = False
+
+    def _on_scroll_value_changed(self, adj: Gtk.Adjustment) -> None:
+        """Pause sticky follow when user scrolls up; resume near bottom."""
+        current = float(adj.get_value())
+        moved_up = current < (self._last_vadjustment_value - 0.5)
+        self._last_vadjustment_value = current
+        if self._is_near_bottom(adj):
+            self._sticky_autoscroll = True
+            return
+        if moved_up:
+            self._sticky_autoscroll = False
+
+    def _is_near_bottom(self, adj: Gtk.Adjustment, threshold_px: float = 28.0) -> bool:
+        remaining = float(adj.get_upper()) - (float(adj.get_value()) + float(adj.get_page_size()))
+        return remaining <= threshold_px
 
     def _update_open_dir_button(self) -> None:
         """Show/hide the open dir button based on whether project directory exists."""
