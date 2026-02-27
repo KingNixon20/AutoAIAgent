@@ -38,12 +38,14 @@ import os
 import json
 import shlex
 import difflib # Added for diff generation
+import ast
 import hashlib
 import time
 from datetime import datetime
 from token_counter import count_text_tokens
 from project_map import refresh_project_map
 import fnmatch # Added for project map generation
+from html.parser import HTMLParser
 import gi
 
 gi.require_version("Gtk", "3.0")
@@ -181,8 +183,15 @@ class MainWindow(Gtk.ApplicationWindow):
         self._active_generation_future = None
         self._pending_tool_permissions: dict[str, dict] = {}
         self._pending_tool_permissions_lock = threading.Lock()
+        self._started_stream_ids: set[str] = set()
         self._file_context_cache: dict[str, dict] = {}
         self._file_context_cache_max_age_sec = 30.0
+        self._file_access_journal: dict[str, dict] = {}
+        self._large_file_line_threshold = 700
+        self._search_then_load_window_sec = 300.0
+        self._diff_snapshot_max_chars = 400000
+        self._constitution_update_state: dict[str, object] = {}
+        self._decision_log_update_state: dict[str, object] = {}
 
         # Create layout: a resizable split between sidebar and chat center
         main_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
@@ -1247,6 +1256,15 @@ class MainWindow(Gtk.ApplicationWindow):
         """
         if not conversation or not self.api_client.is_connected:
             return (None, [], [])
+        stream_delta_emitted = False
+
+        def _on_text_delta_wrapped(delta_text: str) -> None:
+            nonlocal stream_delta_emitted
+            if not delta_text:
+                return
+            stream_delta_emitted = True
+            if on_text_delta:
+                on_text_delta(delta_text)
         # Start with the provided settings
         current_settings = settings
         current_settings = replace(
@@ -1380,6 +1398,7 @@ class MainWindow(Gtk.ApplicationWindow):
                     tool_executor=lambda name, args: self._execute_tool_call_with_approval(
                         name,
                         args,
+                        mode=mode,
                         conversation_id=conversation.id,
                         settings=current_settings,
                         mcp_tool_map=mcp_tool_map,
@@ -1387,9 +1406,13 @@ class MainWindow(Gtk.ApplicationWindow):
                         on_tool_event=ev_collector, # Pass the collector function
                     ),
                     on_tool_event=lambda ev: tool_events.append(ev),
-                    on_text_delta=on_text_delta,
+                    on_text_delta=_on_text_delta_wrapped if on_text_delta else None,
                     stream_response=stream_response,
                 )
+                # If native streaming is unavailable (e.g., tool-enabled responses),
+                # fall back to synthetic word-by-word deltas so all modes visibly stream text.
+                if stream_response and on_text_delta and response_text and not stream_delta_emitted:
+                    self._emit_text_as_word_deltas(response_text, on_text_delta)
                 # Success: break out of retry loop
                 last_exc = None
                 break
@@ -1414,6 +1437,21 @@ class MainWindow(Gtk.ApplicationWindow):
             planned_tasks = self._extract_tasks_from_plan_response(
                 response_text)
         return (response_text, tool_events, planned_tasks)
+
+    def _emit_text_as_word_deltas(self, text: str, on_text_delta: Callable[[str], None]) -> None:
+        """Emit text in word-sized deltas for UI streaming fallback."""
+        if not text or not on_text_delta:
+            return
+        # Keep spaces/newlines attached so reconstructed text matches the source.
+        chunks = re.findall(r"\S+\s*|\s+", text)
+        if not chunks:
+            chunks = [text]
+        for chunk in chunks:
+            try:
+                on_text_delta(chunk)
+            except Exception as e:
+                logger.debug("Failed emitting fallback text delta: %s", e)
+                break
 
     async def _chat_with_retries(self, conversation: Conversation, settings: ConversationSettings, tool_executor=None) -> str:
         """Call `api_client.chat_completion_with_tools` with retry on transient failures.
@@ -1446,10 +1484,69 @@ class MainWindow(Gtk.ApplicationWindow):
                     GLib.idle_add(self.chat_input.set_model_status, False, "Disconnected", priority=GLib.PRIORITY_DEFAULT)
                     raise
 
+    def _normalize_tool_paths_for_mode(self, tool_name: str, args: dict, mode: str) -> dict:
+        """Normalize file path args for Ask mode while preserving sandbox guarantees."""
+        if str(mode or "").strip().lower() != "ask" or not isinstance(args, dict):
+            return args
+
+        root = self._get_workspace_root()
+        root_abs = os.path.abspath(root)
+        allowed_prefix = root_abs + os.sep
+        normalized = dict(args)
+        changed = False
+
+        def _fix_one(path_value: object) -> object:
+            if not isinstance(path_value, str):
+                return path_value
+            raw = path_value.strip()
+            if not raw:
+                return path_value
+            # Only normalize absolute paths. Relative paths remain unchanged.
+            if not os.path.isabs(raw):
+                return path_value
+            abs_path = os.path.abspath(raw)
+            if abs_path == root_abs or abs_path.startswith(allowed_prefix):
+                rel = os.path.relpath(abs_path, root_abs).replace("\\", "/")
+                return rel if rel != "." else "."
+            return path_value
+
+        # Common single-path fields.
+        for key in ("path", "file_path"):
+            if key in normalized:
+                fixed = _fix_one(normalized.get(key))
+                if fixed != normalized.get(key):
+                    normalized[key] = fixed
+                    changed = True
+
+        # Multi-path field.
+        if isinstance(normalized.get("paths"), list):
+            updated = []
+            list_changed = False
+            for item in normalized["paths"]:
+                fixed = _fix_one(item)
+                if fixed != item:
+                    list_changed = True
+                updated.append(fixed)
+            if list_changed:
+                normalized["paths"] = updated
+                changed = True
+
+        # Some tools may use `directory` for folder paths.
+        if "directory" in normalized:
+            fixed = _fix_one(normalized.get("directory"))
+            if fixed != normalized.get("directory"):
+                normalized["directory"] = fixed
+                changed = True
+
+        if changed:
+            logger.debug("Ask-mode path normalization applied for tool %s: %s -> %s", tool_name, args, normalized)
+        return normalized
+
     async def _execute_tool_call_with_approval(
         self,
         tool_name: str,
         args: dict,
+        mode: str,
         conversation_id: str,
         settings: ConversationSettings,
         mcp_tool_map: Optional[dict[str, dict]] = None,
@@ -1457,10 +1554,11 @@ class MainWindow(Gtk.ApplicationWindow):
         on_tool_event: Optional[Callable[[dict], None]] = None, # Added on_tool_event
     ) -> str:
         """Prompt user for tool permission inline before execution unless auto-approved."""
+        normalized_args = self._normalize_tool_paths_for_mode(tool_name, args or {}, mode)
         if not settings.auto_tool_approval:
             approved, enable_auto, deny_reason = await self._request_tool_permission_inline(
                 tool_name=tool_name,
-                args=args,
+                args=normalized_args,
                 conversation_id=conversation_id,
                 mcp_tool_map=mcp_tool_map,
             )
@@ -1473,7 +1571,7 @@ class MainWindow(Gtk.ApplicationWindow):
                     error_message = f"{error_message} Reason: {deny_reason}"
                 tool_event = {
                     "name": tool_name,
-                    "args": args,
+                    "args": normalized_args,
                     "status": "error",
                     "result": {"ok": False, "error": error_message},
                     "details": {"type": "tool_error", "message": error_message}
@@ -1482,7 +1580,7 @@ class MainWindow(Gtk.ApplicationWindow):
                     on_tool_event(tool_event)
                 return json.dumps(tool_event["result"], ensure_ascii=False)
         else:
-            meta = self._tool_permission_metadata(tool_name, args, mcp_tool_map=mcp_tool_map)
+            meta = self._tool_permission_metadata(tool_name, normalized_args, mcp_tool_map=mcp_tool_map)
             GLib.idle_add(
                 self._add_auto_tool_notice_message,
                 conversation_id,
@@ -1495,7 +1593,7 @@ class MainWindow(Gtk.ApplicationWindow):
         
         json_result, tool_event = await self._execute_tool_call(
             tool_name,
-            args,
+            normalized_args,
             mcp_tool_map=mcp_tool_map,
             server_configs=server_configs,
         )
@@ -2129,10 +2227,16 @@ class MainWindow(Gtk.ApplicationWindow):
                     )
                 )
 
+                agent_stream_id = f"agent-task-{conversation_id}-{iteration_num}-{implementation_attempts}"
                 response_text, tool_events, _ = await self._get_api_response(
                     temp_conv,
                     settings,
                     mode="agent",
+                    on_text_delta=(
+                        lambda delta_text, cid=conversation_id, sid=agent_stream_id:
+                            self._on_agent_stream_delta(cid, sid, delta_text)
+                    ),
+                    stream_response=True,
                 )
                 await _post_prompt_checkpoint(
                     f"Phase 3 implementation attempt {implementation_attempts} completed for task {iteration_num}."
@@ -2154,6 +2258,7 @@ class MainWindow(Gtk.ApplicationWindow):
                     conversation_id,
                     tool_events,
                     None,
+                    agent_stream_id,
                     priority=GLib.PRIORITY_DEFAULT,
                 )
                 
@@ -2322,8 +2427,14 @@ class MainWindow(Gtk.ApplicationWindow):
         """Helper to get an icon for a tool event."""
         if status == "error":
             return "❌"
+        if detail_type == "syntax_check_all":
+            return "🧩"
+        if detail_type == "syntax_check":
+            return "🧪"
         if detail_type == "file_edit":
             return "📝"
+        elif detail_type == "file_chunk_read":
+            return "📚"
         elif detail_type == "file_write":
             return "💾"
         elif detail_type == "file_read":
@@ -2373,6 +2484,9 @@ class MainWindow(Gtk.ApplicationWindow):
         elif detail_type == "file_write":
             path = details.get("path", "unknown file")
             bytes_written = details.get("bytes_written", 0)
+            diff = details.get("diff", "")
+            if diff:
+                return f"**File Written:** `{path}` ({bytes_written} bytes)\n```diff\n{diff}\n```"
             content_preview = details.get("content_preview", "")
             preview_line = f"\nContent Preview:\n```\n{content_preview}\n```" if content_preview else ""
             return f"**File Written:** `{path}` ({bytes_written} bytes){preview_line}"
@@ -2382,6 +2496,20 @@ class MainWindow(Gtk.ApplicationWindow):
             content_preview = details.get("content_preview", "")
             preview_line = f"\nContent Preview:\n```\n{content_preview}\n```" if content_preview else ""
             return f"**File Read:** `{path}`{preview_line}"
+
+        elif detail_type == "file_chunk_read":
+            path = details.get("path", "unknown file")
+            ws = details.get("window_start_line")
+            we = details.get("window_end_line")
+            ts = details.get("target_start_line")
+            te = details.get("target_end_line")
+            content_preview = details.get("content_preview", "")
+            preview_line = f"\nContent Preview:\n```\n{content_preview}\n```" if content_preview else ""
+            return (
+                f"**File Chunk Read:** `{path}` "
+                f"(target: {ts}-{te}, window: {ws}-{we})"
+                f"{preview_line}"
+            )
 
         elif detail_type == "file_delete":
             path = details.get("path", "unknown file")
@@ -2414,6 +2542,39 @@ class MainWindow(Gtk.ApplicationWindow):
             if len(matches) > 10:
                 matches_list += f"\n- ... ({len(matches) - 10} more)"
             return f"**Searched for:** `{pattern}` in `{path}`\nMatches:\n{matches_list}"
+
+        elif detail_type == "syntax_check":
+            path = details.get("path", "unknown file")
+            language = details.get("language", "unknown")
+            checker = details.get("checker", "checker")
+            summary = details.get("summary", "")
+            detail = details.get("detail", "")
+            diagnostics = details.get("diagnostics", [])
+            diag_lines = []
+            for d in diagnostics[:8]:
+                if not isinstance(d, dict):
+                    continue
+                line = d.get("line")
+                col = d.get("column")
+                loc = f"{line}:{col}" if line and col else (f"{line}" if line else "?")
+                msg = str(d.get("message", ""))
+                diag_lines.append(f"- `{loc}` {msg}")
+            diags = ("\nDiagnostics:\n" + "\n".join(diag_lines)) if diag_lines else ""
+            detail_block = f"\nOutput:\n```text\n{detail}\n```" if detail else ""
+            return f"**Syntax Check:** `{path}` ({language}, {checker})\n{summary}{diags}{detail_block}"
+
+        elif detail_type == "syntax_check_all":
+            path = details.get("path", ".")
+            summary = details.get("summary", "")
+            checked = details.get("checked_files", 0)
+            passed = details.get("passed_files", 0)
+            fixed = details.get("fixed_files", 0)
+            failed = details.get("failed_files", 0)
+            return (
+                f"**Check All Syntax:** `{path}`\n"
+                f"{summary}\n"
+                f"Checked: {checked}, Passed: {passed}, Fixed: {fixed}, Failed: {failed}"
+            )
         
         # Fallback for generic or unknown tool event types
         result_content = json.dumps(details.get("result", {}), indent=2, ensure_ascii=False)
@@ -2597,6 +2758,9 @@ class MainWindow(Gtk.ApplicationWindow):
         stream_id: str,
     ) -> bool:
         """Start live assistant stream UI for the active conversation only."""
+        if stream_id in self._started_stream_ids:
+            return False
+        self._started_stream_ids.add(stream_id)
         if self.current_conversation and self.current_conversation.id == conversation_id:
             self.chat_area.begin_assistant_stream(stream_id)
         return False
@@ -2612,12 +2776,36 @@ class MainWindow(Gtk.ApplicationWindow):
             self.chat_area.append_assistant_stream(stream_id, delta_text)
         return False
 
+    def _on_agent_stream_delta(
+        self,
+        conversation_id: str,
+        stream_id: str,
+        delta_text: str,
+    ) -> None:
+        """Route agent-mode text deltas to the same streaming UI path."""
+        if not delta_text:
+            return
+        GLib.idle_add(
+            self._begin_stream_for_conversation,
+            conversation_id,
+            stream_id,
+            priority=GLib.PRIORITY_DEFAULT,
+        )
+        GLib.idle_add(
+            self._append_stream_delta_for_conversation,
+            conversation_id,
+            stream_id,
+            delta_text,
+            priority=GLib.PRIORITY_DEFAULT,
+        )
+
     def _end_stream_for_conversation(
         self,
         conversation_id: str,
         stream_id: str,
     ) -> bool:
         """End live assistant stream UI for the active conversation only."""
+        self._started_stream_ids.discard(stream_id)
         if self.current_conversation and self.current_conversation.id == conversation_id:
             self.chat_area.end_assistant_stream(stream_id)
         return False
@@ -2762,6 +2950,7 @@ class MainWindow(Gtk.ApplicationWindow):
             self, mode: str, base_prompt: str, tasks: list[dict]) -> str:
         """Build an augmented system prompt according to selected mode."""
         base = (base_prompt or "You are a helpful AI assistant.").strip()
+        effective_root = self._get_workspace_root()
         if mode == "plan":
             task_context = self._render_ordered_tasks(tasks)
             return (
@@ -2813,13 +3002,27 @@ class MainWindow(Gtk.ApplicationWindow):
                 "IMPORTANT: You are sandboxed to the project directory. All file system operations MUST be relative to the project directory, always provide full paths. Any attempt to access files or directories outside of the project directory will be denied.\n"
                 "Code state rules (mandatory):\n"
                 "- Files on disk are the source of truth. Never rely on conversation memory for code content.\n"
-                "- Before searching/editing/refactoring a file, call builtin_read_file for that file path.\n"
+                "- For large files, use this sequence: 1) builtin_search_text, 2) builtin_read_file_chunk (target block + around 50 lines context), 3) analyze, 4) builtin_edit_file patch.\n"
+                "- Do not load entire large files unless explicitly required.\n"
+                "- Before editing/refactoring a file, call builtin_read_file or builtin_read_file_chunk for that file path.\n"
                 "- Confirm code awareness in your reasoning: \"I have loaded the latest version of this file.\"\n"
                 "- Prefer builtin_edit_file for targeted changes. Use builtin_write_file on existing files only for explicit full rewrites.\n"
+                "- Do not update PROJECT_CONSTITUTION.md repeatedly. Update it only when architecture/principles actually changed.\n"
+                "- If update_project_constitution returns skipped/blocked, do not retry in a loop.\n"
+                "- Add decision log entries only when there is genuinely new decision content. If add_decision_log_entry is skipped/blocked, do not retry in a loop.\n"
                 "After each task, provide a concise progress update and what changed.\n"
                 "Saved tasks:\n"
                 f"{task_context}\n"
                 "Reference the current task you are executing."
+            )
+        if mode == "ask":
+            return (
+                f"{base}\n\n"
+                "You are in ASK mode.\n"
+                "If you decide to use tools, use as few as possible to accomplish a goal\n"
+                "When using filesystem tools, operate only inside the active project directory below.\n"
+                f"Active project directory: {effective_root}\n"
+                "Use workspace-relative file paths for tool calls."
             )
         return base
 
@@ -3751,8 +3954,9 @@ class MainWindow(Gtk.ApplicationWindow):
 
     def _normalize_file_cache_key(self, rel_path: str) -> str:
         """Normalize a workspace-relative path to a stable lowercase cache key."""
+        root = os.path.abspath(self._get_workspace_root()).replace("\\", "/").lower()
         normalized = os.path.normpath(str(rel_path or "").strip().replace("\\", "/"))
-        return normalized.lower()
+        return f"{root}::{normalized.lower()}"
 
     def _content_hash(self, content: str) -> str:
         return hashlib.sha256(content.encode("utf-8")).hexdigest()
@@ -3807,6 +4011,102 @@ class MainWindow(Gtk.ApplicationWindow):
         key = self._normalize_file_cache_key(rel_path)
         self._file_context_cache.pop(key, None)
 
+    def _get_or_create_file_access_state(self, rel_path: str) -> dict:
+        key = self._normalize_file_cache_key(rel_path)
+        state = self._file_access_journal.get(key)
+        if not isinstance(state, dict):
+            state = {"path": rel_path}
+            self._file_access_journal[key] = state
+        return state
+
+    def _record_file_search(self, rel_path: str, pattern: str, line_numbers: list[int]) -> None:
+        state = self._get_or_create_file_access_state(rel_path)
+        state["last_search_ts"] = float(time.time())
+        state["last_search_pattern"] = str(pattern or "")
+        state["last_search_line_numbers"] = list(line_numbers or [])[:128]
+
+    def _record_file_chunk_read(self, rel_path: str, start_line: int, end_line: int) -> None:
+        state = self._get_or_create_file_access_state(rel_path)
+        state["last_chunk_read_ts"] = float(time.time())
+        state["last_chunk_start_line"] = int(start_line)
+        state["last_chunk_end_line"] = int(end_line)
+
+    def _has_recent_search(self, rel_path: str) -> bool:
+        state = self._get_or_create_file_access_state(rel_path)
+        ts = float(state.get("last_search_ts", 0.0))
+        return (float(time.time()) - ts) <= float(self._search_then_load_window_sec)
+
+    def _has_recent_chunk_read(self, rel_path: str) -> bool:
+        state = self._get_or_create_file_access_state(rel_path)
+        ts = float(state.get("last_chunk_read_ts", 0.0))
+        return (float(time.time()) - ts) <= float(self._search_then_load_window_sec)
+
+    def _get_last_diff_snapshot(self, rel_path: str) -> Optional[str]:
+        state = self._get_or_create_file_access_state(rel_path)
+        content = state.get("last_diff_snapshot_content")
+        return content if isinstance(content, str) else None
+
+    def _set_last_diff_snapshot(self, rel_path: str, content: str) -> None:
+        state = self._get_or_create_file_access_state(rel_path)
+        if len(content) > int(self._diff_snapshot_max_chars):
+            state.pop("last_diff_snapshot_content", None)
+            state.pop("last_diff_snapshot_ts", None)
+            return
+        state["last_diff_snapshot_content"] = content
+        state["last_diff_snapshot_ts"] = float(time.time())
+
+    def _clear_last_diff_snapshot(self, rel_path: str) -> None:
+        state = self._get_or_create_file_access_state(rel_path)
+        state.pop("last_diff_snapshot_content", None)
+        state.pop("last_diff_snapshot_ts", None)
+
+    def _file_line_count(self, rel_path: str, target_path: str) -> int:
+        """Count lines with a lightweight per-file cache."""
+        state = self._get_or_create_file_access_state(rel_path)
+        cached_count = state.get("line_count")
+        cached_mtime = state.get("line_count_mtime")
+        try:
+            current_mtime = float(os.path.getmtime(target_path))
+        except Exception:
+            current_mtime = None
+        if isinstance(cached_count, int) and current_mtime is not None and cached_mtime == current_mtime:
+            return cached_count
+
+        count = 0
+        with open(target_path, "r", encoding="utf-8", errors="replace") as f:
+            for count, _ in enumerate(f, start=1):
+                pass
+        state["line_count"] = int(count)
+        state["line_count_mtime"] = current_mtime
+        return int(count)
+
+    def _normalize_constitution_text(self, content: str) -> str:
+        """Normalize constitution text for stable equality checks."""
+        normalized_lines = [line.rstrip() for line in str(content or "").splitlines()]
+        return "\n".join(normalized_lines).strip()
+
+    def _compute_project_change_marker(self, root: str, constitution_path: str) -> float:
+        """Return newest mtime across project files excluding constitution file."""
+        return self._compute_project_change_marker_excluding(root, constitution_path)
+
+    def _compute_project_change_marker_excluding(self, root: str, excluded_path: str) -> float:
+        """Return newest mtime across project files excluding one target file."""
+        latest = 0.0
+        root_abs = os.path.abspath(root)
+        excluded_abs = os.path.abspath(excluded_path)
+        for walk_root, dirs, files in os.walk(root_abs):
+            # Skip known heavy/irrelevant directories.
+            dirs[:] = [d for d in dirs if d not in {".git", "__pycache__", ".venv", "venv", "node_modules"}]
+            for name in files:
+                path = os.path.join(walk_root, name)
+                if os.path.abspath(path) == excluded_abs:
+                    continue
+                try:
+                    latest = max(latest, float(os.path.getmtime(path)))
+                except Exception:
+                    continue
+        return latest
+
     async def _execute_tool_call(
         self,
         tool_name: str,
@@ -3829,7 +4129,13 @@ class MainWindow(Gtk.ApplicationWindow):
                 "read_file": self._tool_read_file,
                 "search_text": self._tool_search_text,
                 "run_command": self._tool_run_command,
+                "builtin_check_syntax": self._tool_builtin_check_syntax,
+                "check_all_syntax": self._tool_check_all_syntax,
+                "update_project_constitution": self._tool_update_project_constitution,
+                "update_project_index": self._tool_update_project_index,
                 "builtin_read_file": self._tool_builtin_read_file,
+                "builtin_read_file_chunk": self._tool_builtin_read_file_chunk,
+                "builtin_search_text": self._tool_search_text,
                 "summarize_file_for_index": self._tool_summarize_file_for_index,
                 "load_files_into_context": self._tool_load_files_into_context,
                 "add_decision_log_entry": self._tool_add_decision_log_entry,
@@ -3929,6 +4235,44 @@ class MainWindow(Gtk.ApplicationWindow):
             logger.error("Failed to update PROJECT_INDEX.json: %s", e)
             return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
 
+    async def _tool_update_project_index(self, args: dict) -> dict:
+        """Built-in wrapper for update_project_index tool definition."""
+        try:
+            raw = await self._update_project_index_tool(
+                file_path=str(args.get("file_path", "")).strip(),
+                purpose=str(args.get("purpose", "")).strip(),
+                public_api=args.get("public_api"),
+                dependencies=args.get("dependencies"),
+                key_responsibilities=args.get("key_responsibilities"),
+                known_issues=args.get("known_issues"),
+            )
+            parsed = json.loads(raw)
+            if not isinstance(parsed, dict):
+                return {"ok": False, "error": "Invalid update_project_index tool response."}
+            if "ok" not in parsed:
+                parsed["ok"] = bool(parsed.get("status") == "success")
+            parsed.setdefault("details", {"type": "project_index_update"})
+            return parsed
+        except Exception as e:
+            return {"ok": False, "error": f"Failed to update project index: {e}"}
+
+    async def _tool_update_project_constitution(self, args: dict) -> dict:
+        """Built-in wrapper for update_project_constitution tool definition."""
+        new_content = str(args.get("new_content", ""))
+        if not new_content.strip():
+            return {"ok": False, "error": "Missing or empty 'new_content' for update_project_constitution."}
+        try:
+            raw = await self._update_project_constitution_tool(new_content)
+            parsed = json.loads(raw)
+            if not isinstance(parsed, dict):
+                return {"ok": False, "error": "Invalid update_project_constitution tool response."}
+            if "ok" not in parsed:
+                parsed["ok"] = bool(parsed.get("status") == "success")
+            parsed.setdefault("details", {"type": "project_constitution_update"})
+            return parsed
+        except Exception as e:
+            return {"ok": False, "error": f"Failed to update project constitution: {e}"}
+
     async def _update_project_constitution_tool(self, new_content: str) -> str:
         """
         Tool: Updates the project constitution file (PROJECT_CONSTITUTION.md).
@@ -3946,13 +4290,88 @@ class MainWindow(Gtk.ApplicationWindow):
         root = self._get_workspace_root()
         constitution_path = os.path.join(root, "PROJECT_CONSTITUTION.md")
         try:
+            incoming_raw = str(new_content or "")
+            incoming_normalized = self._normalize_constitution_text(incoming_raw)
+            incoming_hash = self._content_hash(incoming_normalized)
+
+            current_raw = ""
+            if os.path.exists(constitution_path):
+                try:
+                    with open(constitution_path, "r", encoding="utf-8", errors="replace") as f:
+                        current_raw = f.read()
+                except Exception:
+                    current_raw = ""
+            current_normalized = self._normalize_constitution_text(current_raw)
+
+            # Hard guard 1: no-op updates are not allowed.
+            if incoming_normalized == current_normalized:
+                return json.dumps(
+                    {
+                        "status": "skipped",
+                        "ok": False,
+                        "error": "Skipped PROJECT_CONSTITUTION.md update: content is unchanged.",
+                        "details": {"type": "project_constitution_update", "reason": "unchanged_content"},
+                    }
+                )
+
+            state = self._constitution_update_state if isinstance(self._constitution_update_state, dict) else {}
+            now_ts = float(time.time())
+            last_hash = str(state.get("last_constitution_hash", "") or "")
+            last_attempt_hash = str(state.get("last_attempt_hash", "") or "")
+            last_attempt_ts = float(state.get("last_attempt_ts", 0.0) or 0.0)
+            duplicate_window_sec = 120.0
+
+            # Hard guard 2: block immediate duplicate attempts with same content hash.
+            if (incoming_hash and (incoming_hash == last_hash or incoming_hash == last_attempt_hash)
+                    and (now_ts - last_attempt_ts) <= duplicate_window_sec):
+                self._constitution_update_state["last_attempt_hash"] = incoming_hash
+                self._constitution_update_state["last_attempt_ts"] = now_ts
+                return json.dumps(
+                    {
+                        "status": "blocked",
+                        "ok": False,
+                        "error": "Blocked repeated constitution update request with identical content.",
+                        "details": {"type": "project_constitution_update", "reason": "duplicate_request"},
+                    }
+                )
+
+            # Hard guard 3: block repeated constitution edits when project hasn't changed.
+            project_marker = self._compute_project_change_marker(root, constitution_path)
+            last_marker = float(state.get("last_project_change_marker", 0.0))
+            if float(last_marker) >= float(project_marker) and state.get("last_constitution_hash"):
+                self._constitution_update_state["last_attempt_hash"] = incoming_hash
+                self._constitution_update_state["last_attempt_ts"] = now_ts
+                return json.dumps(
+                    {
+                        "status": "skipped",
+                        "ok": False,
+                        "error": (
+                            "Blocked PROJECT_CONSTITUTION.md update: no project changes detected since "
+                            "the last constitution update."
+                        ),
+                        "details": {"type": "project_constitution_update", "reason": "no_project_changes"},
+                    }
+                )
+
             # Using the imported write_file utility
-            await write_file(constitution_path, new_content.encode('utf-8'))
+            await write_file(constitution_path, incoming_raw.encode('utf-8'))
+            self._constitution_update_state = {
+                "last_constitution_hash": incoming_hash,
+                "last_project_change_marker": float(project_marker),
+                "last_update_ts": now_ts,
+                "last_attempt_hash": incoming_hash,
+                "last_attempt_ts": now_ts,
+            }
             logger.info("Successfully updated PROJECT_CONSTITUTION.md")
-            return json.dumps({"status": "success", "message": "PROJECT_CONSTITUTION.md updated successfully."})
+            return json.dumps({
+                "status": "success",
+                "ok": True,
+                "message": "PROJECT_CONSTITUTION.md updated successfully.",
+                "details": {"type": "project_constitution_update", "reason": "updated"},
+            })
         except Exception as e:
             logger.error("Error updating PROJECT_CONSTITUTION.md: %s", e)
-            return json.dumps({"status": "error", "message": f"Failed to update PROJECT_CONSTITUTION.md: {e}"})
+            return json.dumps({"status": "error", "ok": False, "message": f"Failed to update PROJECT_CONSTITUTION.md: {e}"})
 
     def _builtin_filesystem_tools(self) -> list[dict]:
         """Tool definitions for built-in local filesystem integration."""
@@ -3963,7 +4382,9 @@ class MainWindow(Gtk.ApplicationWindow):
                     "name": "update_project_constitution",
                     "description": (
                         "Updates the project constitution file (PROJECT_CONSTITUTION.md) with the provided content. "
-                        "This file serves as a foundational memory layer for the agent mode. Use this tool only for explicit architecture change tasks."
+                        "This file serves as a foundational memory layer for the agent mode. "
+                        "Use this tool only when architecture/principles have materially changed. "
+                        "Do not call repeatedly with unchanged or near-identical content."
                     ),
                     "parameters": {
                         "type": "object",
@@ -4043,7 +4464,8 @@ class MainWindow(Gtk.ApplicationWindow):
                     "name": "add_decision_log_entry",
                     "description": (
                         "Adds a new entry to the architectural decision log (DECISION_LOG.md). "
-                        "This provides long-term memory of architectural choices, their justifications, and impacts."
+                        "This provides long-term memory of architectural choices, their justifications, and impacts. "
+                        "Do not log duplicate entries; only add when there is genuinely new decision content."
                     ),
                     "parameters": {
                         "type": "object",
@@ -4078,6 +4500,60 @@ class MainWindow(Gtk.ApplicationWindow):
             {
                 "type": "function",
                 "function": {
+                    "name": "builtin_search_text",
+                    "description": "Search text/identifiers and return matching file paths with line numbers. Use this before loading large file chunks.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "pattern": {"type": "string", "description": "Regex or plain text pattern to search for."},
+                            "path": {"type": "string", "description": "Workspace-relative file or directory path to search in."},
+                            "max_results": {"type": "integer", "description": "Maximum number of matches to return."},
+                        },
+                        "required": ["pattern"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "builtin_check_syntax",
+                    "description": (
+                        "Run compile/syntax checks for a file. Supports major formats including Python, HTML, CSS, "
+                        "JSON, and JavaScript/TypeScript (best effort depending on installed toolchain)."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string", "description": "Workspace-relative file path to validate."},
+                            "language": {"type": "string", "description": "Optional language override (python, html, css, json, javascript, typescript)."},
+                        },
+                        "required": ["path"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "check_all_syntax",
+                    "description": (
+                        "Scan supported source files in the workspace, run syntax checks, and optionally auto-fix failing code blocks "
+                        "with LLM-assisted edits. Ignores __pycache__, .git, virtualenv, node_modules, and other junk directories."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string", "description": "Optional workspace-relative directory to scan. Defaults to '.'"},
+                            "auto_fix": {"type": "boolean", "description": "Whether to attempt automatic LLM-assisted block fixes. Defaults to true."},
+                            "max_files": {"type": "integer", "description": "Maximum number of files to scan. Defaults to 400."},
+                            "max_fix_attempts_per_file": {"type": "integer", "description": "Maximum LLM fix attempts per failing file. Defaults to 3."},
+                        },
+                        "required": [],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
                     "name": "builtin_read_file",
                     "description": "Read a UTF-8 text file inside the workspace. Use this before analyzing or editing a file.",
                     "parameters": {
@@ -4085,6 +4561,26 @@ class MainWindow(Gtk.ApplicationWindow):
                         "properties": {
                             "path": {"type": "string", "description": "Workspace-relative file path (e.g., 'src/main.py'). Must not be empty, absolute, or contain '..'."},
                             "max_chars": {"type": "integer", "description": "Optional max chars to read."},
+                            "allow_large_file_full_read": {"type": "boolean", "description": "Optional override for full reads of large files; prefer false and use builtin_read_file_chunk instead."},
+                        },
+                        "required": ["path"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "builtin_read_file_chunk",
+                    "description": "Read a specific line range from a file with context lines above/below. Preferred for large files.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string", "description": "Workspace-relative file path."},
+                            "line": {"type": "integer", "description": "Anchor line for a focused chunk read."},
+                            "start_line": {"type": "integer", "description": "Start line of target section (1-based)."},
+                            "end_line": {"type": "integer", "description": "End line of target section (1-based, inclusive)."},
+                            "context_lines": {"type": "integer", "description": "Lines to include above/below target section. Defaults to 50."},
+                            "max_lines": {"type": "integer", "description": "Max total lines returned (target + context)."},
                         },
                         "required": ["path"],
                     },
@@ -4238,12 +4734,12 @@ class MainWindow(Gtk.ApplicationWindow):
         target = self._safe_path(rel_path)
         if not pattern:
             return {"ok": False, "error": "Missing 'pattern'"}
-        if not target or not os.path.isdir(target):
+        if not target or not (os.path.isdir(target) or os.path.isfile(target)):
             if getattr(self, "_last_safe_root_blocked", False):
                 app_root = getattr(self, "_app_root", "<app_root>")
                 return {"ok": False, "error": f"Operation denied: project workspace root is inside the application directory ({app_root}). Set a project directory outside the application directory to allow filesystem operations."}
             allowed = getattr(self, "_last_safe_root", self._get_workspace_root())
-            return {"ok": False, "error": f"Invalid search path. Path must be inside project workspace: {allowed}"}
+            return {"ok": False, "error": f"Invalid search path. Path must be an existing file or directory inside project workspace: {allowed}"}
 
         cmd = ["rg", "-n", "--max-count", str(max_results), pattern, target]
         try:
@@ -4256,16 +4752,53 @@ class MainWindow(Gtk.ApplicationWindow):
             text = stdout.decode("utf-8", errors="replace").strip()
             err = stderr.decode("utf-8", errors="replace").strip()
             lines = text.splitlines() if text else []
+            matches = lines[:max_results]
+
+            # Capture structured hit locations for search-then-load workflows.
+            grouped_hits: dict[str, list[int]] = {}
+            match_locations = []
+            for line in matches:
+                m = re.match(r"^(.*?):(\d+):(.*)$", line)
+                if not m:
+                    continue
+                hit_path_raw = m.group(1)
+                line_no = int(m.group(2))
+                snippet = m.group(3)
+                hit_abs = os.path.abspath(hit_path_raw)
+                try:
+                    hit_rel = os.path.relpath(hit_abs, self._get_workspace_root())
+                except Exception:
+                    hit_rel = hit_path_raw
+                grouped_hits.setdefault(hit_rel, []).append(line_no)
+                match_locations.append(
+                    {
+                        "path": hit_rel,
+                        "line": line_no,
+                        "snippet": snippet[:300],
+                    }
+                )
+
+            # If searching a single file with no matches, still record search recency.
+            if os.path.isfile(target):
+                search_rel = os.path.relpath(target, self._get_workspace_root())
+                if search_rel not in grouped_hits:
+                    grouped_hits[search_rel] = []
+
+            for file_rel, line_numbers in grouped_hits.items():
+                self._record_file_search(file_rel, pattern, line_numbers)
+
             return {
                 "ok": proc.returncode in (0, 1),
-                "matches": lines[:max_results],
-                "count": len(lines[:max_results]),
+                "matches": matches,
+                "count": len(matches),
+                "match_locations": match_locations,
                 "stderr": err,
                 "details": {
                     "type": "text_search",
                     "pattern": pattern,
                     "path": rel_path,
-                    "matches": lines[:max_results],
+                    "matches": matches,
+                    "match_locations": match_locations[:50],
                 }
             }
         except Exception as e:
@@ -4318,6 +4851,7 @@ class MainWindow(Gtk.ApplicationWindow):
         rel_path = str(args.get("path", "")).strip()
         max_chars = int(args.get("max_chars", 12000))
         max_chars = max(256, min(max_chars, 50000))
+        allow_large_file_full_read = bool(args.get("allow_large_file_full_read", False))
 
         if not rel_path:
             return {"ok": False, "error": "File path cannot be empty. Please provide a valid path within the project directory."}
@@ -4327,6 +4861,25 @@ class MainWindow(Gtk.ApplicationWindow):
             return {"ok": False, "error": f"Invalid characters or path traversal attempt in '{rel_path}'. Please provide a simple relative path."}
 
         target = self._safe_path(rel_path)
+        if not target or not os.path.isfile(target):
+            return {"ok": False, "error": f"Invalid or unsafe file path: '{rel_path}'. Path must be relative and within the project directory."}
+
+        # Large files must use search-then-load chunk flow unless explicitly overridden.
+        try:
+            line_count = self._file_line_count(rel_path, target)
+        except Exception as e:
+            return {"ok": False, "error": f"Failed to inspect file before read: {e}"}
+        is_large = line_count > int(self._large_file_line_threshold)
+        if is_large and not allow_large_file_full_read:
+            return {
+                "ok": False,
+                "error": (
+                    f"File '{rel_path}' is large ({line_count} lines). Use search-then-load workflow: "
+                    "1) builtin_search_text, 2) builtin_read_file_chunk with context_lines≈50."
+                ),
+                "line_count": line_count,
+            }
+
         if target and os.path.isfile(target) and self._is_file_context_cache_fresh(rel_path, target):
             entry = self._file_context_cache.get(self._normalize_file_cache_key(rel_path), {})
             full_content = str(entry.get("content", ""))
@@ -4352,6 +4905,623 @@ class MainWindow(Gtk.ApplicationWindow):
 
         return await self._tool_read_file({"path": rel_path, "max_chars": max_chars})
 
+    async def _tool_builtin_read_file_chunk(self, args: dict) -> dict:
+        """Built-in chunked file read with surrounding context lines."""
+        rel_path = str(args.get("path", "")).strip()
+        line = int(args.get("line", 0) or 0)
+        start_line = int(args.get("start_line", 0) or 0)
+        end_line = int(args.get("end_line", 0) or 0)
+        context_lines = int(args.get("context_lines", 50) or 50)
+        context_lines = max(0, min(context_lines, 200))
+        max_lines = int(args.get("max_lines", 500) or 500)
+        max_lines = max(50, min(max_lines, 1000))
+
+        if not rel_path:
+            return {"ok": False, "error": "File path cannot be empty. Please provide a valid path within the project directory."}
+        if ".." in rel_path or os.path.isabs(rel_path) or any(c in rel_path for c in ['<', '>', ':', '"', '|', '?', '*']):
+            return {"ok": False, "error": f"Invalid characters or path traversal attempt in '{rel_path}'. Please provide a simple relative path."}
+
+        target = self._safe_path(rel_path)
+        if not target or not os.path.isfile(target):
+            return {"ok": False, "error": f"Invalid or unsafe file path: '{rel_path}'. Path must be relative and within the project directory."}
+
+        line_count = self._file_line_count(rel_path, target)
+        is_large = line_count > int(self._large_file_line_threshold)
+        if is_large and not self._has_recent_search(rel_path):
+            return {
+                "ok": False,
+                "error": (
+                    f"Search required before chunk load for large file '{rel_path}'. "
+                    "Call builtin_search_text first, then read a chunk."
+                ),
+                "line_count": line_count,
+            }
+
+        if line <= 0 and start_line <= 0 and end_line <= 0:
+            return {"ok": False, "error": "Provide either 'line' or both 'start_line' and 'end_line'."}
+        if line > 0 and start_line <= 0 and end_line <= 0:
+            start_line = line
+            end_line = line
+        if start_line <= 0:
+            start_line = end_line
+        if end_line <= 0:
+            end_line = start_line
+        if end_line < start_line:
+            start_line, end_line = end_line, start_line
+
+        window_start = max(1, start_line - context_lines)
+        window_end = min(line_count, end_line + context_lines)
+        if window_start > line_count:
+            return {"ok": False, "error": f"Requested chunk starts beyond EOF. File has {line_count} lines."}
+
+        total_lines = (window_end - window_start) + 1
+        if total_lines > max_lines:
+            center = (window_start + window_end) // 2
+            half = max_lines // 2
+            window_start = max(1, center - half)
+            window_end = min(line_count, window_start + max_lines - 1)
+            total_lines = (window_end - window_start) + 1
+
+        out_lines = []
+        try:
+            with open(target, "r", encoding="utf-8", errors="replace") as f:
+                for idx, raw in enumerate(f, start=1):
+                    if idx < window_start:
+                        continue
+                    if idx > window_end:
+                        break
+                    out_lines.append(f"{idx:6d}: {raw.rstrip()}")
+        except Exception as e:
+            return {"ok": False, "error": f"Failed to read file chunk: {e}"}
+
+        content = "\n".join(out_lines)
+        self._record_file_chunk_read(rel_path, start_line, end_line)
+        return {
+            "ok": True,
+            "path": rel_path,
+            "line_count": line_count,
+            "target_start_line": start_line,
+            "target_end_line": end_line,
+            "window_start_line": window_start,
+            "window_end_line": window_end,
+            "context_lines": context_lines,
+            "content": content,
+            "content_hash": self._content_hash(content),
+            "details": {
+                "type": "file_chunk_read",
+                "path": rel_path,
+                "target_start_line": start_line,
+                "target_end_line": end_line,
+                "window_start_line": window_start,
+                "window_end_line": window_end,
+                "content_preview": content[:200],
+            },
+        }
+
+    def _detect_language_for_syntax_check(self, rel_path: str, override: str = "") -> str:
+        """Resolve language from explicit override or file extension."""
+        normalized_override = str(override or "").strip().lower()
+        if normalized_override in {"py", "python"}:
+            return "python"
+        if normalized_override in {"html", "htm"}:
+            return "html"
+        if normalized_override in {"css"}:
+            return "css"
+        if normalized_override in {"json"}:
+            return "json"
+        if normalized_override in {"js", "javascript", "mjs", "cjs"}:
+            return "javascript"
+        if normalized_override in {"ts", "tsx", "typescript"}:
+            return "typescript"
+
+        ext = os.path.splitext(str(rel_path or "").lower())[1]
+        if ext in {".py"}:
+            return "python"
+        if ext in {".html", ".htm"}:
+            return "html"
+        if ext in {".css"}:
+            return "css"
+        if ext in {".json"}:
+            return "json"
+        if ext in {".js", ".mjs", ".cjs"}:
+            return "javascript"
+        if ext in {".ts", ".tsx"}:
+            return "typescript"
+        return "unknown"
+
+    def _line_col_from_index(self, text: str, idx: int) -> tuple[int, int]:
+        idx = max(0, min(len(text), int(idx)))
+        before = text[:idx]
+        line = before.count("\n") + 1
+        col = idx - (before.rfind("\n") + 1) + 1
+        return (line, col)
+
+    def _validate_html_basic(self, content: str) -> tuple[bool, list[dict], str]:
+        """Best-effort HTML validator: parser feed + tag-balance checks."""
+        diagnostics: list[dict] = []
+
+        class _LenientParser(HTMLParser):
+            def __init__(self) -> None:
+                super().__init__(convert_charrefs=True)
+
+        parser = _LenientParser()
+        try:
+            parser.feed(content)
+            parser.close()
+        except Exception as e:
+            diagnostics.append({"line": None, "column": None, "message": f"HTML parser error: {e}"})
+            return (False, diagnostics, "html.parser reported an error.")
+
+        void_tags = {
+            "area", "base", "br", "col", "embed", "hr", "img", "input",
+            "link", "meta", "param", "source", "track", "wbr",
+        }
+        tag_stack: list[tuple[str, int]] = []
+        for m in re.finditer(r"<[^>]+>", content, flags=re.DOTALL):
+            token = m.group(0)
+            raw = token.strip()
+            if raw.startswith("<!--") or raw.startswith("<!") or raw.startswith("<?"):
+                continue
+            close = bool(re.match(r"^</", raw))
+            name_match = re.match(r"^</?\s*([a-zA-Z][\w:-]*)", raw)
+            if not name_match:
+                continue
+            name = name_match.group(1).lower()
+            self_closing = raw.endswith("/>") or name in void_tags
+            if close:
+                if not tag_stack:
+                    line, col = self._line_col_from_index(content, m.start())
+                    diagnostics.append({"line": line, "column": col, "message": f"Unexpected closing tag </{name}>."})
+                    continue
+                open_name, open_idx = tag_stack[-1]
+                if open_name != name:
+                    open_line, open_col = self._line_col_from_index(content, open_idx)
+                    line, col = self._line_col_from_index(content, m.start())
+                    diagnostics.append(
+                        {
+                            "line": line,
+                            "column": col,
+                            "message": f"Mismatched closing tag </{name}>; expected </{open_name}> from line {open_line}:{open_col}.",
+                        }
+                    )
+                    continue
+                tag_stack.pop()
+            elif not self_closing:
+                tag_stack.append((name, m.start()))
+
+        for open_name, open_idx in tag_stack[:20]:
+            line, col = self._line_col_from_index(content, open_idx)
+            diagnostics.append({"line": line, "column": col, "message": f"Unclosed tag <{open_name}>."})
+
+        ok = len(diagnostics) == 0
+        summary = "HTML syntax check passed." if ok else f"HTML syntax check failed with {len(diagnostics)} issue(s)."
+        return (ok, diagnostics, summary)
+
+    def _validate_css_basic(self, content: str) -> tuple[bool, list[dict], str]:
+        """Best-effort CSS syntax validation via delimiter/quote balance scanning."""
+        diagnostics: list[dict] = []
+        stack: list[tuple[str, int]] = []
+        in_single = False
+        in_double = False
+        in_comment = False
+        i = 0
+        while i < len(content):
+            ch = content[i]
+            nxt = content[i + 1] if i + 1 < len(content) else ""
+
+            if in_comment:
+                if ch == "*" and nxt == "/":
+                    in_comment = False
+                    i += 2
+                    continue
+                i += 1
+                continue
+
+            if not in_single and not in_double and ch == "/" and nxt == "*":
+                in_comment = True
+                i += 2
+                continue
+
+            if not in_double and ch == "'" and (i == 0 or content[i - 1] != "\\"):
+                in_single = not in_single
+                i += 1
+                continue
+            if not in_single and ch == "\"" and (i == 0 or content[i - 1] != "\\"):
+                in_double = not in_double
+                i += 1
+                continue
+
+            if in_single or in_double:
+                i += 1
+                continue
+
+            if ch in "{([":
+                stack.append((ch, i))
+            elif ch in "})]":
+                if not stack:
+                    line, col = self._line_col_from_index(content, i)
+                    diagnostics.append({"line": line, "column": col, "message": f"Unexpected closing delimiter '{ch}'."})
+                else:
+                    open_ch, open_idx = stack.pop()
+                    if (open_ch, ch) not in {("{", "}"), ("(", ")"), ("[", "]")}:
+                        line, col = self._line_col_from_index(content, i)
+                        open_line, open_col = self._line_col_from_index(content, open_idx)
+                        diagnostics.append(
+                            {
+                                "line": line,
+                                "column": col,
+                                "message": f"Mismatched delimiter '{ch}' for '{open_ch}' opened at {open_line}:{open_col}.",
+                            }
+                        )
+            i += 1
+
+        if in_comment:
+            diagnostics.append({"line": None, "column": None, "message": "Unclosed CSS comment block."})
+        if in_single:
+            diagnostics.append({"line": None, "column": None, "message": "Unclosed single-quoted string in CSS."})
+        if in_double:
+            diagnostics.append({"line": None, "column": None, "message": "Unclosed double-quoted string in CSS."})
+        for open_ch, open_idx in stack[:20]:
+            line, col = self._line_col_from_index(content, open_idx)
+            diagnostics.append({"line": line, "column": col, "message": f"Unclosed delimiter '{open_ch}'."})
+
+        ok = len(diagnostics) == 0
+        summary = "CSS syntax check passed." if ok else f"CSS syntax check failed with {len(diagnostics)} issue(s)."
+        return (ok, diagnostics, summary)
+
+    async def _run_external_syntax_check(self, cmd: list[str], cwd: str) -> tuple[bool, str]:
+        """Run external syntax checker command and capture combined output."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                cwd=cwd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=20)
+            out = stdout.decode("utf-8", errors="replace").strip()
+            err = stderr.decode("utf-8", errors="replace").strip()
+            combined = (out + ("\n" if out and err else "") + err).strip()
+            return (proc.returncode == 0, combined or "No checker output.")
+        except Exception as e:
+            return (False, f"Failed running external checker ({' '.join(cmd)}): {e}")
+
+    async def _tool_builtin_check_syntax(self, args: dict) -> dict:
+        """Built-in syntax/compile checker for common source formats."""
+        rel_path = str(args.get("path", "")).strip()
+        language_override = str(args.get("language", "")).strip()
+        if not rel_path:
+            return {"ok": False, "error": "File path cannot be empty. Please provide a valid file path."}
+        if ".." in rel_path or os.path.isabs(rel_path) or any(c in rel_path for c in ['<', '>', ':', '"', '|', '?', '*']):
+            return {"ok": False, "error": f"Invalid characters or path traversal attempt in '{rel_path}'."}
+
+        target = self._safe_path(rel_path)
+        if not target or not os.path.isfile(target):
+            return {"ok": False, "error": f"Invalid or unsafe file path: '{rel_path}'."}
+
+        language = self._detect_language_for_syntax_check(rel_path, language_override)
+        root = self._get_workspace_root()
+
+        try:
+            with open(target, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except Exception as e:
+            return {"ok": False, "error": f"Failed to read file for syntax check: {e}"}
+
+        diagnostics: list[dict] = []
+        checker = ""
+        ok = False
+        summary = ""
+        detail = ""
+
+        if language == "python":
+            checker = "python ast parser"
+            try:
+                ast.parse(content, filename=rel_path)
+                ok = True
+                summary = "Python syntax check passed."
+            except SyntaxError as e:
+                ok = False
+                diagnostics.append(
+                    {
+                        "line": int(e.lineno or 0) or None,
+                        "column": int(e.offset or 0) or None,
+                        "message": str(e.msg or "SyntaxError"),
+                    }
+                )
+                summary = f"Python syntax error at line {e.lineno}, column {e.offset}: {e.msg}"
+                detail = f"{type(e).__name__}: {e}"
+        elif language == "json":
+            checker = "json parser"
+            try:
+                json.loads(content)
+                ok = True
+                summary = "JSON syntax check passed."
+            except json.JSONDecodeError as e:
+                ok = False
+                diagnostics.append(
+                    {"line": int(e.lineno or 0) or None, "column": int(e.colno or 0) or None, "message": str(e.msg or "JSONDecodeError")}
+                )
+                summary = f"JSON syntax error at line {e.lineno}, column {e.colno}: {e.msg}"
+                detail = str(e)
+        elif language == "html":
+            checker = "html best-effort parser"
+            ok, diagnostics, summary = self._validate_html_basic(content)
+            if not ok:
+                detail = "\n".join([d.get("message", "") for d in diagnostics[:20]])
+        elif language == "css":
+            checker = "css best-effort parser"
+            ok, diagnostics, summary = self._validate_css_basic(content)
+            if not ok:
+                detail = "\n".join([d.get("message", "") for d in diagnostics[:20]])
+        elif language in {"javascript", "typescript"}:
+            checker = "node --check"
+            cmd = ["node", "--check", target]
+            ok, ext_detail = await self._run_external_syntax_check(cmd, cwd=root)
+            detail = ext_detail
+            summary = "JavaScript/TypeScript syntax check passed." if ok else "JavaScript/TypeScript syntax check failed."
+            if (not ok) and ("Failed running external checker" in ext_detail):
+                diagnostics.append({"line": None, "column": None, "message": "Node.js is not available for syntax checking."})
+        else:
+            return {
+                "ok": False,
+                "error": (
+                    f"Unsupported file type for syntax check: '{rel_path}'. "
+                    "Supported: .py, .html/.htm, .css, .json, .js/.mjs/.cjs, .ts/.tsx"
+                ),
+                "details": {"type": "syntax_check", "path": rel_path, "language": language},
+            }
+
+        result = {
+            "ok": bool(ok),
+            "path": rel_path,
+            "language": language,
+            "checker": checker,
+            "summary": summary,
+            "diagnostics": diagnostics[:50],
+            "detail": detail[:4000] if detail else "",
+            "details": {
+                "type": "syntax_check",
+                "path": rel_path,
+                "language": language,
+                "checker": checker,
+                "summary": summary,
+                "diagnostics": diagnostics[:20],
+                "detail": detail[:1200] if detail else "",
+            },
+        }
+        if not ok:
+            result["error"] = summary
+        return result
+
+    def _strip_code_fences(self, text: str) -> str:
+        raw = str(text or "").strip()
+        fenced = re.search(r"```(?:\w+)?\s*(.*?)\s*```", raw, flags=re.DOTALL)
+        if fenced:
+            return fenced.group(1).strip("\n")
+        return raw
+
+    def _extract_block_by_line(self, content: str, line_no: int, radius: int = 20) -> tuple[str, int, int]:
+        lines = content.splitlines()
+        if not lines:
+            return ("", 1, 1)
+        idx = max(1, min(int(line_no or 1), len(lines)))
+        start = max(1, idx - max(5, radius))
+        end = min(len(lines), idx + max(5, radius))
+        block = "\n".join(lines[start - 1:end])
+        return (block, start, end)
+
+    async def _llm_fix_block(
+        self,
+        rel_path: str,
+        language: str,
+        block_text: str,
+        start_line: int,
+        end_line: int,
+        diagnostics: list[dict],
+    ) -> str:
+        """Request corrected code block from the model; return empty string on failure."""
+        if not self.current_conversation:
+            return ""
+        diag_lines = []
+        for d in diagnostics[:6]:
+            if not isinstance(d, dict):
+                continue
+            line = d.get("line")
+            col = d.get("column")
+            msg = str(d.get("message", ""))
+            if line and col:
+                diag_lines.append(f"- line {line}, col {col}: {msg}")
+            elif line:
+                diag_lines.append(f"- line {line}: {msg}")
+            else:
+                diag_lines.append(f"- {msg}")
+        diagnostics_text = "\n".join(diag_lines) if diag_lines else "- (no structured diagnostics)"
+
+        prompt = (
+            "Fix syntax errors in the following code block.\n"
+            "Rules:\n"
+            "1) Return ONLY the corrected code block text.\n"
+            "2) Do not add markdown fences.\n"
+            "3) Keep intent/behavior unchanged; only minimal syntax-safe edits.\n"
+            "4) Preserve indentation/style.\n\n"
+            f"File: {rel_path}\n"
+            f"Language: {language}\n"
+            f"Block line range: {start_line}-{end_line}\n"
+            f"Diagnostics:\n{diagnostics_text}\n\n"
+            "Code block to fix:\n"
+            f"{block_text}"
+        )
+
+        temp_conv = Conversation(
+            id=str(uuid.uuid4()),
+            title=f"Fix syntax block {rel_path}",
+            model=self.current_conversation.model if self.current_conversation else "default",
+        )
+        temp_conv.add_message(
+            Message(
+                id=str(uuid.uuid4()),
+                role=MessageRole.USER,
+                content=prompt,
+            )
+        )
+        settings = self._get_effective_settings(temp_conv)
+        settings.token_saver = False
+        settings.tools = None
+        settings.tool_choice = None
+        settings.integrations = None
+        settings.system_prompt = (
+            "You are a precise syntax-repair assistant. Output only corrected code text, no markdown."
+        )
+        try:
+            raw = await self._chat_with_retries(temp_conv, settings, tool_executor=None)
+            return self._strip_code_fences(raw)
+        except Exception as e:
+            logger.warning("LLM block fix failed for %s: %s", rel_path, e)
+            return ""
+
+    async def _tool_check_all_syntax(self, args: dict) -> dict:
+        """Scan supported source files; run syntax checks; optionally auto-fix failing blocks."""
+        rel_path = str(args.get("path", ".")).strip() or "."
+        auto_fix = bool(args.get("auto_fix", True))
+        max_files = int(args.get("max_files", 400))
+        max_files = max(1, min(max_files, 2000))
+        max_fix_attempts = int(args.get("max_fix_attempts_per_file", 3))
+        max_fix_attempts = max(1, min(max_fix_attempts, 6))
+
+        target = self._safe_path(rel_path)
+        if not target or not os.path.isdir(target):
+            if getattr(self, "_last_safe_root_blocked", False):
+                app_root = getattr(self, "_app_root", "<app_root>")
+                return {"ok": False, "error": f"Operation denied: project workspace root is inside the application directory ({app_root}). Set a project directory outside the application directory to allow filesystem operations."}
+            allowed = getattr(self, "_last_safe_root", self._get_workspace_root())
+            return {"ok": False, "error": f"Invalid directory path. Path must be inside project workspace: {allowed}"}
+
+        supported_exts = {".py", ".html", ".htm", ".css", ".json", ".js", ".mjs", ".cjs", ".ts", ".tsx"}
+        ignored_dirs = {".git", "__pycache__", ".venv", "venv", "node_modules", ".mypy_cache", ".pytest_cache", ".idea", ".vscode"}
+        root = self._get_workspace_root()
+
+        candidates: list[str] = []
+        for walk_root, dirs, files in os.walk(target):
+            dirs[:] = [d for d in dirs if d not in ignored_dirs and not d.startswith(".cache")]
+            for name in files:
+                ext = os.path.splitext(name.lower())[1]
+                if ext not in supported_exts:
+                    continue
+                abs_path = os.path.join(walk_root, name)
+                try:
+                    rel = os.path.relpath(abs_path, root).replace("\\", "/")
+                except Exception:
+                    rel = os.path.relpath(abs_path, target).replace("\\", "/")
+                candidates.append(rel)
+                if len(candidates) >= max_files:
+                    break
+            if len(candidates) >= max_files:
+                break
+
+        checked = 0
+        passed = 0
+        fixed = 0
+        failed = 0
+        file_results = []
+
+        for rel in candidates:
+            checked += 1
+            check_result = await self._tool_builtin_check_syntax({"path": rel})
+            if check_result.get("ok"):
+                passed += 1
+                continue
+
+            language = str(check_result.get("language", "unknown"))
+            diagnostics = check_result.get("diagnostics", []) if isinstance(check_result.get("diagnostics"), list) else []
+            file_item = {
+                "path": rel,
+                "language": language,
+                "initial_error": str(check_result.get("error", check_result.get("summary", "Syntax check failed"))),
+                "fixed": False,
+            }
+
+            if not auto_fix:
+                failed += 1
+                file_results.append(file_item)
+                continue
+
+            repair_success = False
+            for _ in range(max_fix_attempts):
+                current_read = await self._tool_builtin_read_file(
+                    {"path": rel, "max_chars": 200000, "allow_large_file_full_read": True}
+                )
+                if not current_read.get("ok"):
+                    break
+                current_content = str(current_read.get("content", ""))
+                line_no = 1
+                if diagnostics and isinstance(diagnostics[0], dict):
+                    line_no = int(diagnostics[0].get("line", 1) or 1)
+                block_text, start_line, end_line = self._extract_block_by_line(current_content, line_no, radius=24)
+                if not block_text.strip():
+                    break
+                corrected_block = await self._llm_fix_block(
+                    rel_path=rel,
+                    language=language,
+                    block_text=block_text,
+                    start_line=start_line,
+                    end_line=end_line,
+                    diagnostics=diagnostics,
+                )
+                if not corrected_block.strip() or corrected_block.strip() == block_text.strip():
+                    break
+
+                updated_content = current_content.replace(block_text, corrected_block, 1)
+                write_result = await self._tool_builtin_write_file(
+                    {"path": rel, "content": updated_content, "force_overwrite": True}
+                )
+                if not write_result.get("ok"):
+                    break
+
+                recheck = await self._tool_builtin_check_syntax({"path": rel, "language": language})
+                if recheck.get("ok"):
+                    repair_success = True
+                    break
+                diagnostics = recheck.get("diagnostics", []) if isinstance(recheck.get("diagnostics"), list) else []
+
+            if repair_success:
+                fixed += 1
+                file_item["fixed"] = True
+                file_item["final_status"] = "fixed"
+            else:
+                failed += 1
+                final_check = await self._tool_builtin_check_syntax({"path": rel, "language": language})
+                file_item["final_error"] = str(final_check.get("error", final_check.get("summary", "Syntax check failed")))
+                file_item["final_status"] = "failed"
+            file_results.append(file_item)
+
+        summary = (
+            f"Checked {checked} file(s): {passed} passed, {fixed} fixed, {failed} still failing."
+        )
+        ok = failed == 0
+        return {
+            "ok": ok,
+            "path": rel_path,
+            "checked_files": checked,
+            "passed_files": passed,
+            "fixed_files": fixed,
+            "failed_files": failed,
+            "auto_fix": auto_fix,
+            "summary": summary,
+            "results": file_results[:200],
+            "details": {
+                "type": "syntax_check_all",
+                "path": rel_path,
+                "summary": summary,
+                "checked_files": checked,
+                "passed_files": passed,
+                "fixed_files": fixed,
+                "failed_files": failed,
+                "results": file_results[:50],
+            },
+            "error": None if ok else summary,
+        }
+
     async def _tool_summarize_file_for_index(self, args: dict) -> dict:
         """
         Handles the 'summarize_file_for_index' tool call. Reads a file's content,
@@ -4363,7 +5533,12 @@ class MainWindow(Gtk.ApplicationWindow):
             return {"ok": False, "error": "Missing 'path' argument for summarize_file_for_index."}
 
         # 1. Read the file content
-        read_result = await self._tool_builtin_read_file({"path": file_path})
+        read_result = await self._tool_builtin_read_file(
+            {
+                "path": file_path,
+                "allow_large_file_full_read": True,
+            }
+        )
         if not read_result.get("ok"):
             return {"ok": False, "error": f"Failed to read file for summarization: {read_result.get('error')}"}
         
@@ -4480,50 +5655,108 @@ class MainWindow(Gtk.ApplicationWindow):
         logger.info("Loaded %d files into active context for conversation %s", len(loaded_files), self.current_conversation.id)
         return {"ok": True, "message": f"Successfully loaded {len(loaded_files)} files into active context.", "loaded_files": list(loaded_files.keys())}
     
-    async def _tool_add_decision_log_entry(
-        self,
-        decision_summary: str,
-        reasoning: str,
-        impact: str,
-        related_files: Optional[list[str]] = None,
-        status: str = "implemented",
-    ) -> dict:
-        """
-        Tool: Adds a new entry to the architectural decision log (DECISION_LOG.md).
-        This provides long-term memory of architectural choices, their justifications,
-        and impacts.
+    async def _tool_add_decision_log_entry(self, args: dict) -> dict:
+        """Add a non-duplicate entry to DECISION_LOG.md only when content is genuinely new."""
+        decision_summary = str(args.get("decision_summary", "")).strip()
+        reasoning = str(args.get("reasoning", "")).strip()
+        impact = str(args.get("impact", "")).strip()
+        status = str(args.get("status", "implemented")).strip() or "implemented"
+        raw_related = args.get("related_files", [])
+        related_files: list[str] = []
+        if isinstance(raw_related, list):
+            for item in raw_related:
+                text = str(item).strip()
+                if text:
+                    related_files.append(text)
+        related_files = sorted(set(related_files))
 
-        Args:
-            decision_summary: A concise summary of the decision made.
-            reasoning: The justification or rationale behind the decision.
-            impact: The expected or observed consequences/impact of the decision.
-            related_files: (Optional) A list of files or components affected by this decision.
-            status: (Optional) The current status of the decision (e.g., implemented, pending, reconsidered).
+        if not decision_summary or not reasoning or not impact:
+            return {
+                "ok": False,
+                "error": "Missing required fields: decision_summary, reasoning, and impact are required.",
+                "details": {"type": "decision_log_update", "reason": "missing_required_fields"},
+            }
 
-        Returns:
-            A JSON string indicating success or failure.
-        """
-        log_path = os.path.join(self.workspace_root, "DECISION_LOG.md")
+        root = self._get_workspace_root()
+        log_path = os.path.join(root, "DECISION_LOG.md")
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        entry_content = f"""
+        signature_payload = {
+            "decision_summary": decision_summary,
+            "reasoning": reasoning,
+            "impact": impact,
+            "status": status,
+            "related_files": related_files,
+        }
+        signature = self._content_hash(json.dumps(signature_payload, ensure_ascii=False, sort_keys=True))
+        signature_short = signature[:12]
+
+        try:
+            existing_log = ""
+            if os.path.exists(log_path):
+                with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                    existing_log = f.read()
+
+            # Hard guard 1: do not append duplicate entries (persistent across app restarts).
+            if f"- **Entry ID:** {signature_short}" in existing_log:
+                return {
+                    "ok": False,
+                    "error": "Skipped decision log update: duplicate entry already exists.",
+                    "details": {"type": "decision_log_update", "reason": "duplicate_existing_entry"},
+                }
+
+            state = self._decision_log_update_state if isinstance(self._decision_log_update_state, dict) else {}
+            now_ts = float(time.time())
+            last_hash = str(state.get("last_entry_hash", "") or "")
+            last_attempt_hash = str(state.get("last_attempt_hash", "") or "")
+            last_attempt_ts = float(state.get("last_attempt_ts", 0.0) or 0.0)
+            duplicate_window_sec = 120.0
+
+            # Hard guard 2: block repeated immediate attempts with same entry payload.
+            if signature and (signature == last_hash or signature == last_attempt_hash) and (now_ts - last_attempt_ts) <= duplicate_window_sec:
+                self._decision_log_update_state["last_attempt_hash"] = signature
+                self._decision_log_update_state["last_attempt_ts"] = now_ts
+                return {
+                    "ok": False,
+                    "error": "Blocked repeated decision log request with identical content.",
+                    "details": {"type": "decision_log_update", "reason": "duplicate_request"},
+                }
+
+            project_marker = self._compute_project_change_marker_excluding(root, log_path)
+            self._decision_log_update_state = {
+                "last_entry_hash": signature,
+                "last_project_change_marker": float(project_marker),
+                "last_update_ts": now_ts,
+                "last_attempt_hash": signature,
+                "last_attempt_ts": now_ts,
+            }
+
+            entry_content = f"""
 ## Decision: {decision_summary}
 - **Date:** {timestamp}
+- **Entry ID:** {signature_short}
 - **Reasoning:** {reasoning}
 - **Impact:** {impact}
 - **Status:** {status}
 """
-        if related_files:
-            entry_content += f"- **Related Files:** {', '.join(related_files)}\n"
-        entry_content += "\n---\n" # Separator
+            if related_files:
+                entry_content += f"- **Related Files:** {', '.join(related_files)}\n"
+            entry_content += "\n---\n"
 
-        try:
             await asyncio.to_thread(append_file, log_path, entry_content)
             logger.info("Successfully added entry to DECISION_LOG.md")
-            return {"ok": True, "message": "Decision log entry added successfully."}
+            return {
+                "ok": True,
+                "message": "Decision log entry added successfully.",
+                "details": {"type": "decision_log_update", "reason": "updated", "entry_id": signature_short},
+            }
         except Exception as e:
             logger.error("Error adding entry to DECISION_LOG.md: %s", e)
-            return {"ok": False, "error": f"Failed to add decision log entry: {e}"}
+            return {
+                "ok": False,
+                "error": f"Failed to add decision log entry: {e}",
+                "details": {"type": "decision_log_update", "reason": "error"},
+            }
 
     async def _tool_perform_milestone_review(self, args: dict) -> dict:
         """Placeholder for milestone review tool.
@@ -4557,7 +5790,13 @@ class MainWindow(Gtk.ApplicationWindow):
         read_before_write = False
         if existing_file:
             # Mandatory read-before-write: load latest disk-backed state first.
-            read_result = await self._tool_builtin_read_file({"path": rel_path, "max_chars": 50000})
+            read_result = await self._tool_builtin_read_file(
+                {
+                    "path": rel_path,
+                    "max_chars": 50000,
+                    "allow_large_file_full_read": True,
+                }
+            )
             if not read_result.get("ok"):
                 return {"ok": False, "error": f"Cannot overwrite existing file without loading latest content: {read_result.get('error')}"}
             read_before_write = True
@@ -4583,6 +5822,11 @@ class MainWindow(Gtk.ApplicationWindow):
             parent = os.path.dirname(target)
             if parent:
                 os.makedirs(parent, exist_ok=True)
+            prior_content = None
+            baseline_content = None
+            if existing_file:
+                prior_content = str(read_result.get("content", ""))
+                baseline_content = self._get_last_diff_snapshot(rel_path) or prior_content
             with open(target, "w", encoding="utf-8") as f:
                 f.write(content)
             cache_entry = self._cache_file_context(
@@ -4591,6 +5835,25 @@ class MainWindow(Gtk.ApplicationWindow):
                 from_disk=True,
                 target_path=target,
             )
+            op_diff = ""
+            cumulative_diff = ""
+            if existing_file and prior_content is not None:
+                op_diff = "".join(difflib.unified_diff(
+                    prior_content.splitlines(keepends=True),
+                    content.splitlines(keepends=True),
+                    fromfile=rel_path + " (before write)",
+                    tofile=rel_path + " (after write)",
+                    lineterm=""
+                ))
+                if baseline_content is not None:
+                    cumulative_diff = "".join(difflib.unified_diff(
+                        baseline_content.splitlines(keepends=True),
+                        content.splitlines(keepends=True),
+                        fromfile=rel_path + " (last shown)",
+                        tofile=rel_path + " (current)",
+                        lineterm=""
+                    ))
+            self._set_last_diff_snapshot(rel_path, content)
             return {
                 "ok": True,
                 "path": rel_path,
@@ -4605,6 +5868,8 @@ class MainWindow(Gtk.ApplicationWindow):
                     "bytes_written": len(content.encode("utf-8")),
                     "content_hash": cache_entry.get("content_hash"),
                     "read_before_write": read_before_write,
+                    "diff": cumulative_diff or op_diff,
+                    "operation_diff": op_diff,
                     "content_preview": content[:200]
                 }
             }
@@ -4632,9 +5897,34 @@ class MainWindow(Gtk.ApplicationWindow):
             return {"ok": False, "error": f"Invalid or unsafe file path: '{rel_path}'. Path must be relative and within the project directory."}
         if find_text == "":
             return {"ok": False, "error": "'find' must not be empty"}
+
+        line_count = self._file_line_count(rel_path, target)
+        if line_count > int(self._large_file_line_threshold):
+            if not self._has_recent_search(rel_path):
+                return {
+                    "ok": False,
+                    "error": (
+                        f"Large-file edit blocked for '{rel_path}'. Required workflow: "
+                        "1) builtin_search_text, 2) builtin_read_file_chunk, 3) builtin_edit_file."
+                    ),
+                }
+            if not self._has_recent_chunk_read(rel_path):
+                return {
+                    "ok": False,
+                    "error": (
+                        f"Large-file edit blocked for '{rel_path}'. Load target chunk first with "
+                        "builtin_read_file_chunk (include context lines)."
+                    ),
+                }
         try:
             # Mandatory read-before-write: always load the latest file state first.
-            read_result = await self._tool_builtin_read_file({"path": rel_path, "max_chars": 50000})
+            read_result = await self._tool_builtin_read_file(
+                {
+                    "path": rel_path,
+                    "max_chars": 50000,
+                    "allow_large_file_full_read": True,
+                }
+            )
             if not read_result.get("ok"):
                 return {"ok": False, "error": f"Cannot edit file without loading latest content: {read_result.get('error')}"}
             original_content = str(read_result.get("content", ""))
@@ -4673,6 +5963,15 @@ class MainWindow(Gtk.ApplicationWindow):
                 tofile=rel_path + " (modified)",
                 lineterm=""
             ))
+            baseline_content = self._get_last_diff_snapshot(rel_path) or original_content
+            diff_since_last = list(difflib.unified_diff(
+                baseline_content.splitlines(keepends=True),
+                updated_content.splitlines(keepends=True),
+                fromfile=rel_path + " (last shown)",
+                tofile=rel_path + " (current)",
+                lineterm=""
+            ))
+            self._set_last_diff_snapshot(rel_path, updated_content)
 
             return {
                 "ok": True,
@@ -4687,7 +5986,8 @@ class MainWindow(Gtk.ApplicationWindow):
                     "path": rel_path,
                     "content_hash": cache_entry.get("content_hash"),
                     "read_before_edit": True,
-                    "diff": "".join(diff)
+                    "diff": "".join(diff_since_last),
+                    "operation_diff": "".join(diff),
                 }
             }
         except Exception as e:
@@ -4714,6 +6014,7 @@ class MainWindow(Gtk.ApplicationWindow):
         try:
             os.remove(target)
             self._drop_file_context_cache(rel_path)
+            self._clear_last_diff_snapshot(rel_path)
             return {"ok": True, "path": rel_path, "deleted": True}
         except Exception as e:
             return {"ok": False, "error": f"Failed to delete file: {e}"}
@@ -4988,23 +6289,23 @@ class MainWindow(Gtk.ApplicationWindow):
 
     def _get_workspace_root(self) -> str:
         """Return the effective workspace root for the current context."""
-        # Prefer per-conversation agent project_dir when valid and not inside app code
+        # Prefer per-conversation configured project_dir when valid and not inside app code.
+        # This applies in Ask mode as well so filesystem tools target the intended project.
         if self.current_conversation:
-            if self.current_conversation.chat_mode == "agent":
-                cfg = self.current_conversation.agent_config
-                if isinstance(cfg, dict):
-                    proj_dir = str(cfg.get("project_dir", "")).strip()
-                    if proj_dir and os.path.isdir(proj_dir):
-                        try:
-                            proj_dir_abs = os.path.abspath(proj_dir)
-                            # Reject project dirs that are inside the application code
-                            app_root = getattr(self, "_app_root", os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
-                            if proj_dir_abs == app_root or proj_dir_abs.startswith(app_root + os.sep):
-                                logger.warning("Ignoring agent project_dir inside app repo: %s", proj_dir_abs)
-                            else:
-                                return proj_dir_abs
-                        except Exception:
-                            pass
+            cfg = self.current_conversation.agent_config
+            if isinstance(cfg, dict):
+                proj_dir = str(cfg.get("project_dir", "")).strip()
+                if proj_dir and os.path.isdir(proj_dir):
+                    try:
+                        proj_dir_abs = os.path.abspath(proj_dir)
+                        # Reject project dirs that are inside the application code
+                        app_root = getattr(self, "_app_root", os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+                        if proj_dir_abs == app_root or proj_dir_abs.startswith(app_root + os.sep):
+                            logger.warning("Ignoring agent project_dir inside app repo: %s", proj_dir_abs)
+                        else:
+                            return proj_dir_abs
+                    except Exception:
+                        pass
         return self.workspace_root
 
     def _default_model_name(self) -> str:
@@ -5036,23 +6337,33 @@ class MainWindow(Gtk.ApplicationWindow):
     def _apply_default_tool_enables(self, mode: str) -> None:
         """Enable commonly-used integrations by default when in Agent mode.
 
-        These integrations are disabled in Ask/Plan modes to avoid accidental tool use.
+        Ask mode keeps builtin filesystem enabled so it can read/write/edit/delete files.
+        Plan mode keeps tool integrations disabled.
         """
-        defaults = [
+        agent_defaults = [
             "mcp/builtin_filesystem",
             "mcp/serpapi",
             "mcp/CLI Access",
         ]
+        ask_defaults = [
+            "mcp/builtin_filesystem",
+        ]
         if not hasattr(self, "tools_bar") or not self.tools_bar:
             return
         if mode == "agent":
-            for iid in defaults:
+            for iid in agent_defaults:
+                try:
+                    self.tools_bar.set_tool_enabled(iid, True)
+                except Exception:
+                    pass
+        elif mode == "ask":
+            for iid in ask_defaults:
                 try:
                     self.tools_bar.set_tool_enabled(iid, True)
                 except Exception:
                     pass
         else:
-            for iid in defaults:
+            for iid in agent_defaults:
                 try:
                     self.tools_bar.set_tool_enabled(iid, False)
                 except Exception:
